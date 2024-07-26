@@ -1,0 +1,3488 @@
+This patch introduce a new telemetry command '/sff_module/info'
+to dump format module EEPROM information.
+
+  In telemetry client run command:
+  --> /sff_module/info,<port number>
+
+  Both primary application and telemetry client will show the formated
+  module EEPROM information.
+
+ drivers/common/meson.build                |    1 +
+ drivers/common/sff_module/meson.build     |   16 +
+ drivers/common/sff_module/sff_8079.c      |  672 ++++++++++++++
+ drivers/common/sff_module/sff_8472.c      |  301 ++++++
+ drivers/common/sff_module/sff_8636.c      | 1004 +++++++++++++++++++++
+ drivers/common/sff_module/sff_8636.h      |  592 ++++++++++++
+ drivers/common/sff_module/sff_common.c    |  415 +++++++++
+ drivers/common/sff_module/sff_common.h    |  192 ++++
+ drivers/common/sff_module/sff_telemetry.c |  142 +++
+ drivers/common/sff_module/sff_telemetry.h |   41 +
+ drivers/common/sff_module/version.map     |    9 +
+ 11 files changed, 3385 insertions(+)
+ create mode 100644 drivers/common/sff_module/meson.build
+ create mode 100644 drivers/common/sff_module/sff_8079.c
+ create mode 100644 drivers/common/sff_module/sff_8472.c
+ create mode 100644 drivers/common/sff_module/sff_8636.c
+ create mode 100644 drivers/common/sff_module/sff_8636.h
+ create mode 100644 drivers/common/sff_module/sff_common.c
+ create mode 100644 drivers/common/sff_module/sff_common.h
+ create mode 100644 drivers/common/sff_module/sff_telemetry.c
+ create mode 100644 drivers/common/sff_module/sff_telemetry.h
+ create mode 100644 drivers/common/sff_module/version.map
+
+diff --git a/drivers/common/meson.build b/drivers/common/meson.build
+index ea261dd70a..7b183769ca 100644
+--- a/drivers/common/meson.build
++++ b/drivers/common/meson.build
+@@ -8,4 +8,5 @@ drivers = [
+         'iavf',
+         'mvep',
+         'octeontx',
++        'sff_module',
+ ]
+diff --git a/drivers/common/sff_module/meson.build b/drivers/common/sff_module/meson.build
+new file mode 100644
+index 0000000000..1160b07ba2
+--- /dev/null
++++ b/drivers/common/sff_module/meson.build
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: BSD-3-Clause
++# Copyright(c) 2019-2021 Intel Corporation
++
++sources = files(
++        'sff_common.c',
++        'sff_8079.c',
++        'sff_8472.c',
++        'sff_8636.c',
++        'sff_telemetry.c'
++)
++
++deps += ['ethdev']
++
++if cc.has_argument('-Wno-pointer-to-int-cast')
++        cflags += '-Wno-pointer-to-int-cast'
++endif
+\ No newline at end of file
+diff --git a/drivers/common/sff_module/sff_8079.c b/drivers/common/sff_module/sff_8079.c
+new file mode 100644
+index 0000000000..173cb0493e
+--- /dev/null
++++ b/drivers/common/sff_module/sff_8079.c
+@@ -0,0 +1,672 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2022 Intel Corporation
++ *
++ * Implements SFF-8079 optics diagnostics.
++ *
++ */
++
++#include <stdio.h>
++#include <rte_mbuf.h>
++#include <rte_ethdev.h>
++#include <rte_flow.h>
++#include "sff_common.h"
++#include "sff_telemetry.h"
++
++static void sff_8079_show_identifier(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_identifier(id, 0, items);
++}
++
++static void sff_8079_show_ext_identifier(const uint8_t *id, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x", "Extended identifier", id[1]);
++	sprintf(val_string, "0x%02x", id[1]);
++	if (id[1] == 0x00) {
++		printf(" (GBIC not specified / not MOD_DEF compliant)\n");
++		strcat(val_string, " (GBIC not specified / not MOD_DEF compliant)");
++	} else if (id[1] == 0x04) {
++		printf(" (GBIC/SFP defined by 2-wire interface ID)\n");
++		strcat(val_string, " (GBIC/SFP defined by 2-wire interface ID)");
++	} else if (id[1] <= 0x07) {
++		printf(" (GBIC compliant with MOD_DEF %u)\n", id[1]);
++		char *tmp;
++		sprintf(tmp, " (GBIC compliant with MOD_DEF %u)", id[1]);
++		strcat(val_string, tmp);
++	} else {
++		printf(" (unknown)\n");
++		strcat(val_string, " (unknown)");
++	}
++	add_item_string(items, "Extended identifier", val_string);
++}
++
++static void sff_8079_show_connector(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_connector(id, 2, items);
++}
++
++static void sff_8079_show_transceiver(const uint8_t *id, sff_item *items)
++{
++	static const char *pfx =
++		"Transceiver type                          :";
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",
++		"Transceiver codes",
++	       id[3], id[4], id[5], id[6],
++	       id[7], id[8], id[9], id[10], id[36]);
++	sprintf(val_string,
++		"0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x",
++		id[3], id[4], id[5], id[6], id[7], id[8], id[9], id[10], id[36]);
++	add_item_string(items, "Transceiver codes", val_string);
++
++	/* 10G Ethernet Compliance Codes */
++	if (id[3] & (1 << 7)) {
++		printf("%s 10G Ethernet: 10G Base-ER [SFF-8472 rev10.4 onwards]\n", pfx);
++		add_item_string(items, "10G Ethernet transceiver type",
++		"10G Ethernet: 10G Base-ER [SFF-8472 rev10.4 onwards]");
++	}
++	if (id[3] & (1 << 6)) {
++		printf("%s 10G Ethernet: 10G Base-LRM\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"10G Ethernet: 10G Base-LRM");
++	}
++	if (id[3] & (1 << 5)) {
++		printf("%s 10G Ethernet: 10G Base-LR\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"10G Ethernet: 10G Base-LR");
++	}
++	if (id[3] & (1 << 4)) {
++		printf("%s 10G Ethernet: 10G Base-SR\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"10G Ethernet: 10G Base-SR");
++	}
++
++	/* Infiniband Compliance Codes */
++	if (id[3] & (1 << 3)) {
++		printf("%s Infiniband: 1X SX\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Infiniband: 1X SX");
++	}
++	if (id[3] & (1 << 2)) {
++		printf("%s Infiniband: 1X LX\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Infiniband: 1X LX");
++	}
++	if (id[3] & (1 << 1)) {
++		printf("%s Infiniband: 1X Copper Active\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Infiniband: 1X Copper Active");
++	}
++	if (id[3] & (1 << 0)) {
++		printf("%s Infiniband: 1X Copper Passive\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Infiniband: 1X Copper Passive");
++	}
++
++	/* ESCON Compliance Codes */
++	if (id[4] & (1 << 7)) {
++		printf("%s ESCON: ESCON MMF, 1310nm LED\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"ESCON: ESCON MMF, 1310nm LED");
++	}
++	if (id[4] & (1 << 6)) {
++		printf("%s ESCON: ESCON SMF, 1310nm Laser\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"ESCON: ESCON SMF, 1310nm Laser");
++	}
++
++	/* SONET Compliance Codes */
++	if (id[4] & (1 << 5)) {
++		printf("%s SONET: OC-192, short reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-192, short reach");
++	}
++	if (id[4] & (1 << 4)) {
++		printf("%s SONET: SONET reach specifier bit 1\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: SONET reach specifier bit 1");
++	}
++	if (id[4] & (1 << 3)) {
++		printf("%s SONET: SONET reach specifier bit 2\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: SONET reach specifier bit 2");
++	}
++	if (id[4] & (1 << 2)) {
++		printf("%s SONET: OC-48, long reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-48, long reach");
++	}
++	if (id[4] & (1 << 1)) {
++		printf("%s SONET: OC-48, intermediate reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-48, intermediate reach");
++	}
++	if (id[4] & (1 << 0)) {
++		printf("%s SONET: OC-48, short reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-48, short reach");
++	}
++	if (id[5] & (1 << 6)) {
++		printf("%s SONET: OC-12, single mode, long reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-12, single mode, long reach");
++	}
++	if (id[5] & (1 << 5)) {
++		printf("%s SONET: OC-12, single mode, inter. reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-12, single mode, inter. reach");
++	}
++	if (id[5] & (1 << 4)) {
++		printf("%s SONET: OC-12, short reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-12, short reach");
++	}
++	if (id[5] & (1 << 2)) {
++		printf("%s SONET: OC-3, single mode, long reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-3, single mode, long reach");
++	}
++	if (id[5] & (1 << 1)) {
++		printf("%s SONET: OC-3, single mode, inter. reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-3, single mode, inter. reach");
++	}
++	if (id[5] & (1 << 0)) {
++		printf("%s SONET: OC-3, short reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"SONET: OC-3, short reach");
++	}
++
++	/* Ethernet Compliance Codes */
++	if (id[6] & (1 << 7)) {
++		printf("%s Ethernet: BASE-PX\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: BASE-PX");
++	}
++	if (id[6] & (1 << 6)) {
++		printf("%s Ethernet: BASE-BX10\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: BASE-BX10");
++	}
++	if (id[6] & (1 << 5)) {
++		printf("%s Ethernet: 100BASE-FX\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: 100BASE-FX");
++	}
++	if (id[6] & (1 << 4)) {
++		printf("%s Ethernet: 100BASE-LX/LX10\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: 100BASE-LX/LX10");
++	}
++	if (id[6] & (1 << 3)) {
++		printf("%s Ethernet: 1000BASE-T\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: 1000BASE-T");
++	}
++	if (id[6] & (1 << 2)) {
++		printf("%s Ethernet: 1000BASE-CX\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: 1000BASE-CX");
++	}
++	if (id[6] & (1 << 1)) {
++		printf("%s Ethernet: 1000BASE-LX\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: 1000BASE-LX");
++	}
++	if (id[6] & (1 << 0)) {
++		printf("%s Ethernet: 1000BASE-SX\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Ethernet: 1000BASE-SX");
++	}
++
++	/* Fibre Channel link length */
++	if (id[7] & (1 << 7)) {
++		printf("%s FC: very long distance (V)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: very long distance (V)");
++	}
++	if (id[7] & (1 << 6)) {
++		printf("%s FC: short distance (S)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: short distance (S)");
++	}
++	if (id[7] & (1 << 5)) {
++		printf("%s FC: intermediate distance (I)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: intermediate distance (I)");
++	}
++	if (id[7] & (1 << 4)) {
++		printf("%s FC: long distance (L)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: long distance (L)");
++	}
++	if (id[7] & (1 << 3)) {
++		printf("%s FC: medium distance (M)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: medium distance (M)");
++	}
++
++	/* Fibre Channel transmitter technology */
++	if (id[7] & (1 << 2)) {
++		printf("%s FC: Shortwave laser, linear Rx (SA)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Shortwave laser, linear Rx (SA)");
++	}
++	if (id[7] & (1 << 1)) {
++		printf("%s FC: Longwave laser (LC)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Longwave laser (LC)");
++	}
++	if (id[7] & (1 << 0)) {
++		printf("%s FC: Electrical inter-enclosure (EL)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Electrical inter-enclosure (EL)");
++	}
++	if (id[8] & (1 << 7)) {
++		printf("%s FC: Electrical intra-enclosure (EL)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Electrical intra-enclosure (EL)");
++	}
++	if (id[8] & (1 << 6)) {
++		printf("%s FC: Shortwave laser w/o OFC (SN)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Shortwave laser w/o OFC (SN)");
++	}
++	if (id[8] & (1 << 5)) {
++		printf("%s FC: Shortwave laser with OFC (SL)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Shortwave laser with OFC (SL)");
++	}
++	if (id[8] & (1 << 4)) {
++		printf("%s FC: Longwave laser (LL)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Longwave laser (LL)");
++	}
++	if (id[8] & (1 << 3)) {
++		printf("%s Active Cable\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Active Cable");
++	}
++	if (id[8] & (1 << 2)) {
++		printf("%s Passive Cable\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Passive Cable");
++	}
++	if (id[8] & (1 << 1)) {
++		printf("%s FC: Copper FC-BaseT\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Copper FC-BaseT");
++	}
++
++	/* Fibre Channel transmission media */
++	if (id[9] & (1 << 7)) {
++		printf("%s FC: Twin Axial Pair (TW)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Twin Axial Pair (TW)");
++	}
++	if (id[9] & (1 << 6)) {
++		printf("%s FC: Twisted Pair (TP)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Twisted Pair (TP)");
++	}
++	if (id[9] & (1 << 5)) {
++		printf("%s FC: Miniature Coax (MI)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Miniature Coax (MI)");
++	}
++	if (id[9] & (1 << 4)) {
++		printf("%s FC: Video Coax (TV)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Video Coax (TV)");
++	}
++	if (id[9] & (1 << 3)) {
++		printf("%s FC: Multimode, 62.5um (M6)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Multimode, 62.5um (M6)");
++	}
++	if (id[9] & (1 << 2)) {
++		printf("%s FC: Multimode, 50um (M5)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Multimode, 50um (M5)");
++	}
++	if (id[9] & (1 << 0)) {
++		printf("%s FC: Single Mode (SM)\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: Single Mode (SM)");
++	}
++
++	/* Fibre Channel speed */
++	if (id[10] & (1 << 7)) {
++		printf("%s FC: 1200 MBytes/sec\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: 1200 MBytes/sec");
++	}
++	if (id[10] & (1 << 6)) {
++		printf("%s FC: 800 MBytes/sec\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: 800 MBytes/sec");
++	}
++	if (id[10] & (1 << 4)) {
++		printf("%s FC: 400 MBytes/sec\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: 400 MBytes/sec");
++	}
++	if (id[10] & (1 << 2)) {
++		printf("%s FC: 200 MBytes/sec\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: 200 MBytes/sec");
++	}
++	if (id[10] & (1 << 0)) {
++		printf("%s FC: 100 MBytes/sec\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"FC: 100 MBytes/sec");
++	}
++
++	/* Extended Specification Compliance Codes from SFF-8024 */
++	switch (id[36]) {
++	case 0x1:
++		printf("%s Extended: 100G AOC or 25GAUI C2M AOC with worst BER of 5x10^(-5)\n",
++		       pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G AOC or 25GAUI C2M AOC with worst BER of 5x10^(-5)");
++		break;
++	case 0x2:
++		printf("%s Extended: 100G Base-SR4 or 25GBase-SR\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G Base-SR4 or 25GBase-SR");
++		break;
++	case 0x3:
++		printf("%s Extended: 100G Base-LR4 or 25GBase-LR\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G Base-LR4 or 25GBase-LR");
++		break;
++	case 0x4:
++		printf("%s Extended: 100G Base-ER4 or 25GBase-ER\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G Base-ER4 or 25GBase-ER");
++		break;
++	case 0x8:
++		printf("%s Extended: 100G ACC or 25GAUI C2M ACC with worst BER of 5x10^(-5)\n",
++		       pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G ACC or 25GAUI C2M ACC with worst BER of 5x10^(-5)");
++		break;
++	case 0xb:
++		printf("%s Extended: 100G Base-CR4 or 25G Base-CR CA-L\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G Base-CR4 or 25G Base-CR CA-L");
++		break;
++	case 0xc:
++		printf("%s Extended: 25G Base-CR CA-S\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 25G Base-CR CA-S");
++		break;
++	case 0xd:
++		printf("%s Extended: 25G Base-CR CA-N\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 25G Base-CR CA-N");
++		break;
++	case 0x16:
++		printf("%s Extended: 10Gbase-T with SFI electrical interface\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 10Gbase-T with SFI electrical interface");
++		break;
++	case 0x18:
++		printf("%s Extended: 100G AOC or 25GAUI C2M AOC with worst BER of 10^(-12)\n",
++		       pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G AOC or 25GAUI C2M AOC with worst BER of 10^(-12)");
++		break;
++	case 0x19:
++		printf("%s Extended: 100G ACC or 25GAUI C2M ACC with worst BER of 10^(-12)\n",
++		       pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 100G ACC or 25GAUI C2M ACC with worst BER of 10^(-12)");
++		break;
++	case 0x1c:
++		printf("%s Extended: 10Gbase-T Short Reach\n", pfx);
++		add_item_string(items, "Transceiver type",
++		"Extended: 10Gbase-T Short Reach");
++		break;
++	default:
++		break;
++	}
++}
++
++static void sff_8079_show_encoding(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_encoding(id, 11, RTE_ETH_MODULE_SFF_8472, items);
++}
++
++static void sff_8079_show_rate_identifier(const uint8_t *id, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x", "Rate identifier", id[13]);
++	sprintf(val_string, "0x%02x", id[13]);
++
++	switch (id[13]) {
++	case 0x00:
++		printf(" (unspecified)\n");
++		strcat(val_string, " (unspecified)");
++		break;
++	case 0x01:
++		printf(" (4/2/1G Rate_Select & AS0/AS1)\n");
++		strcat(val_string, " (4/2/1G Rate_Select & AS0/AS1)");
++		break;
++	case 0x02:
++		printf(" (8/4/2G Rx Rate_Select only)\n");
++		strcat(val_string, " (8/4/2G Rx Rate_Select only)");
++		break;
++	case 0x03:
++		printf(" (8/4/2G Independent Rx & Tx Rate_Select)\n");
++		strcat(val_string, " (8/4/2G Independent Rx & Tx Rate_Select)");
++		break;
++	case 0x04:
++		printf(" (8/4/2G Tx Rate_Select only)\n");
++		strcat(val_string, " (8/4/2G Tx Rate_Select only)");
++		break;
++	default:
++		printf(" (reserved or unknown)\n");
++		strcat(val_string, " (reserved or unknown)");
++		break;
++	}
++	add_item_string(items, "Rate identifier", val_string);
++}
++
++static void sff_8079_show_oui(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_oui(id, 37, items);
++}
++
++static void
++sff_8079_show_wavelength_or_copper_compliance(const uint8_t *id,
++					      sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	if (id[8] & (1 << 2)) {
++		printf("%-41s : 0x%02x", "Passive Cu cmplnce.", id[60]);
++		sprintf(val_string, "0x%02x", id[60]);
++		switch (id[60]) {
++		case 0x00:
++			printf(" (unspecified)");
++			strcat(val_string, " (unspecified)");
++			break;
++		case 0x01:
++			printf(" (SFF-8431 appendix E)");
++			strcat(val_string, " (SFF-8431 appendix E)");
++			break;
++		default:
++			printf(" (unknown)");
++			strcat(val_string, " (unknown)");
++			break;
++		}
++		printf(" [SFF-8472 rev10.4 only]\n");
++		strcat(val_string, " [SFF-8472 rev10.4 only]");
++		add_item_string(items, "Passive Cu cmplnce.", val_string);
++	} else if (id[8] & (1 << 3)) {
++		printf("%-41s : 0x%02x", "Active Cu cmplnce.", id[60]);
++		sprintf(val_string, "0x%02x", id[60]);
++		switch (id[60]) {
++		case 0x00:
++			printf(" (unspecified)");
++			strcat(val_string, " (unspecified)");
++			break;
++		case 0x01:
++			printf(" (SFF-8431 appendix E)");
++			strcat(val_string, " (SFF-8431 appendix E)");
++			break;
++		case 0x04:
++			printf(" (SFF-8431 limiting)");
++			strcat(val_string, " (SFF-8431 limiting)");
++			break;
++		default:
++			printf(" (unknown)");
++			strcat(val_string, " (unknown)");
++			break;
++		}
++		printf(" [SFF-8472 rev10.4 only]\n");
++		strcat(val_string, " [SFF-8472 rev10.4 only]");
++		add_item_string(items, "Active Cu cmplnce.", val_string);
++	} else {
++		printf("%-41s : %unm\n", "Laser wavelength",
++		       (id[60] << 8) | id[61]);
++		sprintf(val_string, "%unm", (id[60] << 8) | id[61]);
++		add_item_string(items, "Laser wavelength", val_string);
++	}
++}
++
++static void sff_8079_show_options(const uint8_t *id, sff_item *items)
++{
++	static const char *pfx =
++		"Option                                    :";
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x 0x%02x\n", "Option values", id[64], id[65]);
++	sprintf(val_string, "0x%02x 0x%02x", id[64], id[65]);
++	add_item_string(items, "Option values", val_string);
++
++	if (id[65] & (1 << 1)) {
++		printf("%s RX_LOS implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "RX_LOS implemented");
++	}
++	if (id[65] & (1 << 2)) {
++		printf("%s RX_LOS implemented, inverted\n", pfx);
++		add_item_string(items, "Option",
++				       "RX_LOS implemented, inverted");
++	}
++	if (id[65] & (1 << 3)) {
++		printf("%s TX_FAULT implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "TX_FAULT implemented");
++	}
++	if (id[65] & (1 << 4)) {
++		printf("%s TX_DISABLE implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "TX_DISABLE implemented");
++	}
++	if (id[65] & (1 << 5)) {
++		printf("%s RATE_SELECT implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "RATE_SELECT implemented");
++	}
++	if (id[65] & (1 << 6)) {
++		printf("%s Tunable transmitter technology\n", pfx);
++		add_item_string(items, "Option",
++				       "Tunable transmitter technology");
++	}
++	if (id[65] & (1 << 7)) {
++		printf("%s Receiver decision threshold implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "Receiver decision threshold implemented");
++	}
++	if (id[64] & (1 << 0)) {
++		printf("%s Linear receiver output implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "Linear receiver output implemented");
++	}
++	if (id[64] & (1 << 1)) {
++		printf("%s Power level 2 requirement\n", pfx);
++		add_item_string(items, "Option",
++				       "Power level 2 requirement");
++	}
++	if (id[64] & (1 << 2)) {
++		printf("%s Cooled transceiver implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "Cooled transceiver implemented");
++	}
++	if (id[64] & (1 << 3)) {
++		printf("%s Retimer or CDR implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "Retimer or CDR implemented");
++	}
++	if (id[64] & (1 << 4)) {
++		printf("%s Paging implemented\n", pfx);
++		add_item_string(items, "Option",
++				       "Paging implemented");
++	}
++	if (id[64] & (1 << 5)) {
++		printf("%s Power level 3 requirement\n", pfx);
++		add_item_string(items, "Option",
++				       "Power level 3 requirement");
++	}
++}
++
++void sff_8079_show_all(const uint8_t *id, sff_item *items)
++{
++	sff_8079_show_identifier(id, items);
++	if (((id[0] == 0x02) || (id[0] == 0x03)) && (id[1] == 0x04)) {
++		unsigned int br_nom, br_min, br_max;
++		char val_string[TMP_STRING_SIZE];
++
++		if (id[12] == 0) {
++			br_nom = br_min = br_max = 0;
++		} else if (id[12] == 255) {
++			br_nom = id[66] * 250;
++			br_max = id[67];
++			br_min = id[67];
++		} else {
++			br_nom = id[12] * 100;
++			br_max = id[66];
++			br_min = id[67];
++		}
++		sff_8079_show_ext_identifier(id, items);
++		sff_8079_show_connector(id, items);
++		sff_8079_show_transceiver(id, items);
++		sff_8079_show_encoding(id, items);
++
++		printf("%-41s : %u%s\n", "BR, Nominal", br_nom, "MBd");
++		sprintf(val_string, "%uMBd", br_nom);
++		add_item_string(items, "BR, Nominal", val_string);
++
++		sff_8079_show_rate_identifier(id, items);
++		sff_show_value_with_unit(id, 14,
++					     "Length (SMF,km)", 1, "km", items);
++		sff_show_value_with_unit(id, 15, "Length (SMF)", 100, "m", items);
++		sff_show_value_with_unit(id, 16, "Length (50um)", 10, "m", items);
++		sff_show_value_with_unit(id, 17,
++					     "Length (62.5um)", 10, "m", items);
++		sff_show_value_with_unit(id, 18, "Length (Copper)", 1, "m", items);
++		sff_show_value_with_unit(id, 19, "Length (OM3)", 10, "m", items);
++		sff_8079_show_wavelength_or_copper_compliance(id, items);
++		sff_show_ascii(id, 20, 35, "Vendor name", items);
++		sff_8079_show_oui(id, items);
++		sff_show_ascii(id, 40, 55, "Vendor PN", items);
++		sff_show_ascii(id, 56, 59, "Vendor rev", items);
++		sff_8079_show_options(id, items);
++
++		printf("%-41s : %u%s\n", "BR margin, max", br_max, "%");
++		sprintf(val_string, "%u%%", br_max);
++		add_item_string(items, "BR margin, max", val_string);
++		printf("%-41s : %u%s\n", "BR margin, min", br_min, "%");
++		sprintf(val_string, "%u%%", br_min);
++		add_item_string(items, "BR margin, min", val_string);
++
++		sff_show_ascii(id, 68, 83, "Vendor SN", items);
++		sff_show_ascii(id, 84, 91, "Date code", items);
++	}
++}
+diff --git a/drivers/common/sff_module/sff_8472.c b/drivers/common/sff_module/sff_8472.c
+new file mode 100644
+index 0000000000..6111b25e12
+--- /dev/null
++++ b/drivers/common/sff_module/sff_8472.c
+@@ -0,0 +1,301 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2022 Intel Corporation
++ *
++ * Implements SFF-8472 optics diagnostics.
++ *
++ */
++
++#include <stdio.h>
++#include <math.h>
++#include <arpa/inet.h>
++#include <rte_mbuf.h>
++#include <rte_ethdev.h>
++#include <rte_flow.h>
++#include "sff_common.h"
++#include "sff_telemetry.h"
++
++/* Offsets in decimal, for direct comparison with the SFF specs */
++
++/* A0-based EEPROM offsets for DOM support checks */
++#define SFF_A0_DOM                        92
++#define SFF_A0_OPTIONS                    93
++#define SFF_A0_COMP                       94
++
++/* EEPROM bit values for various registers */
++#define SFF_A0_DOM_EXTCAL                 (1 << 4)
++#define SFF_A0_DOM_INTCAL                 (1 << 5)
++#define SFF_A0_DOM_IMPL                   (1 << 6)
++#define SFF_A0_DOM_PWRT                   (1 << 3)
++
++#define SFF_A0_OPTIONS_AW                 (1 << 7)
++
++/*
++ * This is the offset at which the A2 page is in the EEPROM 
++ * blob returned by the kernel.
++ */
++#define SFF_A2_BASE                       0x100
++
++/* A2-based offsets for DOM */
++#define SFF_A2_TEMP                       96
++#define SFF_A2_TEMP_HALRM                 0
++#define SFF_A2_TEMP_LALRM                 2
++#define SFF_A2_TEMP_HWARN                 4
++#define SFF_A2_TEMP_LWARN                 6
++
++#define SFF_A2_VCC                        98
++#define SFF_A2_VCC_HALRM                  8
++#define SFF_A2_VCC_LALRM                  10
++#define SFF_A2_VCC_HWARN                  12
++#define SFF_A2_VCC_LWARN                  14
++
++#define SFF_A2_BIAS                       100
++#define SFF_A2_BIAS_HALRM                 16
++#define SFF_A2_BIAS_LALRM                 18
++#define SFF_A2_BIAS_HWARN                 20
++#define SFF_A2_BIAS_LWARN                 22
++
++#define SFF_A2_TX_PWR                     102
++#define SFF_A2_TX_PWR_HALRM               24
++#define SFF_A2_TX_PWR_LALRM               26
++#define SFF_A2_TX_PWR_HWARN               28
++#define SFF_A2_TX_PWR_LWARN               30
++
++#define SFF_A2_RX_PWR                     104
++#define SFF_A2_RX_PWR_HALRM               32
++#define SFF_A2_RX_PWR_LALRM               34
++#define SFF_A2_RX_PWR_HWARN               36
++#define SFF_A2_RX_PWR_LWARN               38
++
++#define SFF_A2_ALRM_FLG                   112
++#define SFF_A2_WARN_FLG                   116
++
++/* 32-bit little-endian calibration constants */
++#define SFF_A2_CAL_RXPWR4                 56
++#define SFF_A2_CAL_RXPWR3                 60
++#define SFF_A2_CAL_RXPWR2                 64
++#define SFF_A2_CAL_RXPWR1                 68
++#define SFF_A2_CAL_RXPWR0                 72
++
++/* 16-bit little endian calibration constants */
++#define SFF_A2_CAL_TXI_SLP                76
++#define SFF_A2_CAL_TXI_OFF                78
++#define SFF_A2_CAL_TXPWR_SLP              80
++#define SFF_A2_CAL_TXPWR_OFF              82
++#define SFF_A2_CAL_T_SLP                  84
++#define SFF_A2_CAL_T_OFF                  86
++#define SFF_A2_CAL_V_SLP                  88
++#define SFF_A2_CAL_V_OFF                  90
++
++static struct sff_8472_aw_flags {
++	const char *str;        /* Human-readable string, null at the end */
++	int offset;             /* A2-relative address offset */
++	uint8_t value;             /* Alarm is on if (offset & value) != 0. */
++} sff_8472_aw_flags[] = {
++	{ "Laser bias current high alarm",   SFF_A2_ALRM_FLG, (1 << 3) },
++	{ "Laser bias current low alarm",    SFF_A2_ALRM_FLG, (1 << 2) },
++	{ "Laser bias current high warning", SFF_A2_WARN_FLG, (1 << 3) },
++	{ "Laser bias current low warning",  SFF_A2_WARN_FLG, (1 << 2) },
++
++	{ "Laser output power high alarm",   SFF_A2_ALRM_FLG, (1 << 1) },
++	{ "Laser output power low alarm",    SFF_A2_ALRM_FLG, (1 << 0) },
++	{ "Laser output power high warning", SFF_A2_WARN_FLG, (1 << 1) },
++	{ "Laser output power low warning",  SFF_A2_WARN_FLG, (1 << 0) },
++
++	{ "Module temperature high alarm",   SFF_A2_ALRM_FLG, (1 << 7) },
++	{ "Module temperature low alarm",    SFF_A2_ALRM_FLG, (1 << 6) },
++	{ "Module temperature high warning", SFF_A2_WARN_FLG, (1 << 7) },
++	{ "Module temperature low warning",  SFF_A2_WARN_FLG, (1 << 6) },
++
++	{ "Module voltage high alarm",   SFF_A2_ALRM_FLG, (1 << 5) },
++	{ "Module voltage low alarm",    SFF_A2_ALRM_FLG, (1 << 4) },
++	{ "Module voltage high warning", SFF_A2_WARN_FLG, (1 << 5) },
++	{ "Module voltage low warning",  SFF_A2_WARN_FLG, (1 << 4) },
++
++	{ "Laser rx power high alarm",   SFF_A2_ALRM_FLG + 1, (1 << 7) },
++	{ "Laser rx power low alarm",    SFF_A2_ALRM_FLG + 1, (1 << 6) },
++	{ "Laser rx power high warning", SFF_A2_WARN_FLG + 1, (1 << 7) },
++	{ "Laser rx power low warning",  SFF_A2_WARN_FLG + 1, (1 << 6) },
++
++	{ NULL, 0, 0 },
++};
++
++/* Most common case: 16-bit unsigned integer in a certain unit */
++#define A2_OFFSET_TO_U16(offset) \
++	(id[SFF_A2_BASE + (offset)] << 8 | id[SFF_A2_BASE + (offset) + 1])
++
++/* Calibration slope is a number between 0.0 included and 256.0 excluded. */
++#define A2_OFFSET_TO_SLP(offset) \
++	(id[SFF_A2_BASE + (offset)] + id[SFF_A2_BASE + (offset) + 1] / 256.)
++
++/* Calibration offset is an integer from -32768 to 32767 */
++#define A2_OFFSET_TO_OFF(offset) \
++	((int16_t)A2_OFFSET_TO_U16(offset))
++
++/* RXPWR(x) are IEEE-754 floating point numbers in big-endian format */
++#define A2_OFFSET_TO_RXPWRx(offset) \
++	(befloattoh((const uint32_t *)(id + SFF_A2_BASE + (offset))))
++
++/*
++ * 2-byte internal temperature conversions:
++ * First byte is a signed 8-bit integer, which is the temp decimal part
++ * Second byte are 1/256th of degree, which are added to the dec part.
++ */
++#define A2_OFFSET_TO_TEMP(offset) ((int16_t)A2_OFFSET_TO_U16(offset))
++
++static void sff_8472_dom_parse(const uint8_t *id, struct sff_diags *sd)
++{
++	sd->bias_cur[MCURR] = A2_OFFSET_TO_U16(SFF_A2_BIAS);
++	sd->bias_cur[HALRM] = A2_OFFSET_TO_U16(SFF_A2_BIAS_HALRM);
++	sd->bias_cur[LALRM] = A2_OFFSET_TO_U16(SFF_A2_BIAS_LALRM);
++	sd->bias_cur[HWARN] = A2_OFFSET_TO_U16(SFF_A2_BIAS_HWARN);
++	sd->bias_cur[LWARN] = A2_OFFSET_TO_U16(SFF_A2_BIAS_LWARN);
++
++	sd->sfp_voltage[MCURR] = A2_OFFSET_TO_U16(SFF_A2_VCC);
++	sd->sfp_voltage[HALRM] = A2_OFFSET_TO_U16(SFF_A2_VCC_HALRM);
++	sd->sfp_voltage[LALRM] = A2_OFFSET_TO_U16(SFF_A2_VCC_LALRM);
++	sd->sfp_voltage[HWARN] = A2_OFFSET_TO_U16(SFF_A2_VCC_HWARN);
++	sd->sfp_voltage[LWARN] = A2_OFFSET_TO_U16(SFF_A2_VCC_LWARN);
++
++	sd->tx_power[MCURR] = A2_OFFSET_TO_U16(SFF_A2_TX_PWR);
++	sd->tx_power[HALRM] = A2_OFFSET_TO_U16(SFF_A2_TX_PWR_HALRM);
++	sd->tx_power[LALRM] = A2_OFFSET_TO_U16(SFF_A2_TX_PWR_LALRM);
++	sd->tx_power[HWARN] = A2_OFFSET_TO_U16(SFF_A2_TX_PWR_HWARN);
++	sd->tx_power[LWARN] = A2_OFFSET_TO_U16(SFF_A2_TX_PWR_LWARN);
++
++	sd->rx_power[MCURR] = A2_OFFSET_TO_U16(SFF_A2_RX_PWR);
++	sd->rx_power[HALRM] = A2_OFFSET_TO_U16(SFF_A2_RX_PWR_HALRM);
++	sd->rx_power[LALRM] = A2_OFFSET_TO_U16(SFF_A2_RX_PWR_LALRM);
++	sd->rx_power[HWARN] = A2_OFFSET_TO_U16(SFF_A2_RX_PWR_HWARN);
++	sd->rx_power[LWARN] = A2_OFFSET_TO_U16(SFF_A2_RX_PWR_LWARN);
++
++	sd->sfp_temp[MCURR] = A2_OFFSET_TO_TEMP(SFF_A2_TEMP);
++	sd->sfp_temp[HALRM] = A2_OFFSET_TO_TEMP(SFF_A2_TEMP_HALRM);
++	sd->sfp_temp[LALRM] = A2_OFFSET_TO_TEMP(SFF_A2_TEMP_LALRM);
++	sd->sfp_temp[HWARN] = A2_OFFSET_TO_TEMP(SFF_A2_TEMP_HWARN);
++	sd->sfp_temp[LWARN] = A2_OFFSET_TO_TEMP(SFF_A2_TEMP_LWARN);
++}
++
++/* Converts to a float from a big-endian 4-byte source buffer. */
++static float befloattoh(const uint32_t *source)
++{
++	union {
++		uint32_t src;
++		float dst;
++	} converter;
++
++	converter.src = ntohl(*source);
++	return converter.dst;
++}
++
++static void sff_8472_calibration(const uint8_t *id, struct sff_diags *sd)
++{
++	unsigned long i;
++	uint16_t rx_reading;
++
++	/* Calibration should occur for all values (threshold and current) */
++	for (i = 0; i < ARRAY_SIZE(sd->bias_cur); ++i) {
++		/*
++		 * Apply calibration formula 1 (Temp., Voltage, Bias, Tx Power)
++		 */
++		sd->bias_cur[i]    *= A2_OFFSET_TO_SLP(SFF_A2_CAL_TXI_SLP);
++		sd->tx_power[i]    *= A2_OFFSET_TO_SLP(SFF_A2_CAL_TXPWR_SLP);
++		sd->sfp_voltage[i] *= A2_OFFSET_TO_SLP(SFF_A2_CAL_V_SLP);
++		sd->sfp_temp[i]    *= A2_OFFSET_TO_SLP(SFF_A2_CAL_T_SLP);
++
++		sd->bias_cur[i]    += A2_OFFSET_TO_OFF(SFF_A2_CAL_TXI_OFF);
++		sd->tx_power[i]    += A2_OFFSET_TO_OFF(SFF_A2_CAL_TXPWR_OFF);
++		sd->sfp_voltage[i] += A2_OFFSET_TO_OFF(SFF_A2_CAL_V_OFF);
++		sd->sfp_temp[i]    += A2_OFFSET_TO_OFF(SFF_A2_CAL_T_OFF);
++
++		/*
++		 * Apply calibration formula 2 (Rx Power only)
++		 */
++		rx_reading = sd->rx_power[i];
++		sd->rx_power[i]    = A2_OFFSET_TO_RXPWRx(SFF_A2_CAL_RXPWR0);
++		sd->rx_power[i]    += rx_reading *
++			A2_OFFSET_TO_RXPWRx(SFF_A2_CAL_RXPWR1);
++		sd->rx_power[i]    += rx_reading *
++			A2_OFFSET_TO_RXPWRx(SFF_A2_CAL_RXPWR2);
++		sd->rx_power[i]    += rx_reading *
++			A2_OFFSET_TO_RXPWRx(SFF_A2_CAL_RXPWR3);
++	}
++}
++
++static void sff_8472_parse_eeprom(const uint8_t *id, struct sff_diags *sd)
++{
++	sd->supports_dom = id[SFF_A0_DOM] & SFF_A0_DOM_IMPL;
++	sd->supports_alarms = id[SFF_A0_OPTIONS] & SFF_A0_OPTIONS_AW;
++	sd->calibrated_ext = id[SFF_A0_DOM] & SFF_A0_DOM_EXTCAL;
++	sd->rx_power_type = id[SFF_A0_DOM] & SFF_A0_DOM_PWRT;
++
++	sff_8472_dom_parse(id, sd);
++
++	/*
++	 * If the SFP is externally calibrated, we need to read calibration data
++	 * and compensate the already stored readings.
++	 */
++	if (sd->calibrated_ext)
++		sff_8472_calibration(id, sd);
++}
++
++void sff_8472_show_all(const uint8_t *id, sff_item *items)
++{
++	struct sff_diags sd = {0};
++	const char *rx_power_string = NULL;
++	char val_string[TMP_STRING_SIZE];
++	int i;
++
++	sff_8472_parse_eeprom(id, &sd);
++
++	if (!sd.supports_dom) {
++		printf("%-41s : No\n", "Optical diagnostics support");
++		add_item_string(items, "Optical diagnostics support", "No");
++		return;
++	}
++	printf("%-41s : Yes\n", "Optical diagnostics support");
++	add_item_string(items, "Optical diagnostics support", "Yes");
++
++	PRINT_BIAS("Laser bias current", sd.bias_cur[MCURR]);
++	SPRINT_BIAS(val_string, sd.bias_cur[MCURR]);
++	add_item_string(items, "Laser bias current", val_string);
++
++	PRINT_xX_PWR("Laser output power", sd.tx_power[MCURR]);
++	SPRINT_xX_PWR(val_string, sd.tx_power[MCURR]);
++	add_item_string(items, "Laser output power", val_string);
++
++	if (!sd.rx_power_type)
++		rx_power_string = "Receiver signal OMA";
++	else
++		rx_power_string = "Receiver signal average optical power";
++
++	PRINT_xX_PWR(rx_power_string, sd.rx_power[MCURR]);
++	SPRINT_xX_PWR(val_string, sd.rx_power[MCURR]);
++	add_item_string(items, rx_power_string, val_string);
++
++	PRINT_TEMP("Module temperature", sd.sfp_temp[MCURR]);
++	SPRINT_TEMP(val_string, sd.sfp_temp[MCURR]);
++	add_item_string(items, "Module temperature", val_string);
++
++	PRINT_VCC("Module voltage", sd.sfp_voltage[MCURR]);
++	SPRINT_VCC(val_string, sd.sfp_voltage[MCURR]);
++	add_item_string(items, "Module voltage", val_string);
++
++	printf("%-41s : %s\n", "Alarm/warning flags implemented",
++	       (sd.supports_alarms ? "Yes" : "No"));
++	add_item_string(items, "Alarm/warning flags implemented",
++			       (sd.supports_alarms ? "Yes" : "No"));
++
++	if (sd.supports_alarms) {
++
++		for (i = 0; sff_8472_aw_flags[i].str; ++i) {
++			printf("%-41s : %s\n", sff_8472_aw_flags[i].str,
++			       id[SFF_A2_BASE + sff_8472_aw_flags[i].offset]
++			       & sff_8472_aw_flags[i].value ? "On" : "Off");
++			add_item_string(items, sff_8472_aw_flags[i].str,
++					id[SFF_A2_BASE + sff_8472_aw_flags[i].offset]
++					& sff_8472_aw_flags[i].value ? "On" : "Off");
++		}
++		sff_show_thresholds(sd, items);
++	}
++}
++
+diff --git a/drivers/common/sff_module/sff_8636.c b/drivers/common/sff_module/sff_8636.c
+new file mode 100644
+index 0000000000..c21e0665b6
+--- /dev/null
++++ b/drivers/common/sff_module/sff_8636.c
+@@ -0,0 +1,1004 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2022 Intel Corporation
++ *
++ * Implements SFF-8636 based QSFP+/QSFP28 Diagnostics Memory map.
++ *
++ */
++
++#include <stdio.h>
++#include <math.h>
++#include <rte_mbuf.h>
++#include <rte_ethdev.h>
++#include <rte_flow.h>
++#include "sff_common.h"
++#include "sff_8636.h"
++#include "sff_telemetry.h"
++
++#define MAX_DESC_SIZE	42
++
++static struct sff_8636_aw_flags {
++	const char *str;        /* Human-readable string, null at the end */
++	int offset;             /* A2-relative address offset */
++	uint8_t value;             /* Alarm is on if (offset & value) != 0. */
++} sff_8636_aw_flags[] = {
++	{ "Laser bias current high alarm   (Chan 1)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_1_HALARM) },
++	{ "Laser bias current low alarm    (Chan 1)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_1_LALARM) },
++	{ "Laser bias current high warning (Chan 1)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_1_HWARN) },
++	{ "Laser bias current low warning  (Chan 1)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_1_LWARN) },
++
++	{ "Laser bias current high alarm   (Chan 2)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_2_HALARM) },
++	{ "Laser bias current low alarm    (Chan 2)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_2_LALARM) },
++	{ "Laser bias current high warning (Chan 2)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_2_HWARN) },
++	{ "Laser bias current low warning  (Chan 2)",
++		SFF_8636_TX_BIAS_12_AW_OFFSET, (SFF_8636_TX_BIAS_2_LWARN) },
++
++	{ "Laser bias current high alarm   (Chan 3)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_3_HALARM) },
++	{ "Laser bias current low alarm    (Chan 3)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_3_LALARM) },
++	{ "Laser bias current high warning (Chan 3)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_3_HWARN) },
++	{ "Laser bias current low warning  (Chan 3)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_3_LWARN) },
++
++	{ "Laser bias current high alarm   (Chan 4)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_4_HALARM) },
++	{ "Laser bias current low alarm    (Chan 4)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_4_LALARM) },
++	{ "Laser bias current high warning (Chan 4)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_4_HWARN) },
++	{ "Laser bias current low warning  (Chan 4)",
++		SFF_8636_TX_BIAS_34_AW_OFFSET, (SFF_8636_TX_BIAS_4_LWARN) },
++
++	{ "Module temperature high alarm",
++		SFF_8636_TEMP_AW_OFFSET, (SFF_8636_TEMP_HALARM_STATUS) },
++	{ "Module temperature low alarm",
++		SFF_8636_TEMP_AW_OFFSET, (SFF_8636_TEMP_LALARM_STATUS) },
++	{ "Module temperature high warning",
++		SFF_8636_TEMP_AW_OFFSET, (SFF_8636_TEMP_HWARN_STATUS) },
++	{ "Module temperature low warning",
++		SFF_8636_TEMP_AW_OFFSET, (SFF_8636_TEMP_LWARN_STATUS) },
++
++	{ "Module voltage high alarm",
++		SFF_8636_VCC_AW_OFFSET, (SFF_8636_VCC_HALARM_STATUS) },
++	{ "Module voltage low alarm",
++		SFF_8636_VCC_AW_OFFSET, (SFF_8636_VCC_LALARM_STATUS) },
++	{ "Module voltage high warning",
++		SFF_8636_VCC_AW_OFFSET, (SFF_8636_VCC_HWARN_STATUS) },
++	{ "Module voltage low warning",
++		SFF_8636_VCC_AW_OFFSET, (SFF_8636_VCC_LWARN_STATUS) },
++
++	{ "Laser tx power high alarm   (Channel 1)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_1_HALARM) },
++	{ "Laser tx power low alarm    (Channel 1)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_1_LALARM) },
++	{ "Laser tx power high warning (Channel 1)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_1_HWARN) },
++	{ "Laser tx power low warning  (Channel 1)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_1_LWARN) },
++
++	{ "Laser tx power high alarm   (Channel 2)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_2_HALARM) },
++	{ "Laser tx power low alarm    (Channel 2)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_2_LALARM) },
++	{ "Laser tx power high warning (Channel 2)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_2_HWARN) },
++	{ "Laser tx power low warning  (Channel 2)",
++		SFF_8636_TX_PWR_12_AW_OFFSET, (SFF_8636_TX_PWR_2_LWARN) },
++
++	{ "Laser tx power high alarm   (Channel 3)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_3_HALARM) },
++	{ "Laser tx power low alarm    (Channel 3)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_3_LALARM) },
++	{ "Laser tx power high warning (Channel 3)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_3_HWARN) },
++	{ "Laser tx power low warning  (Channel 3)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_3_LWARN) },
++
++	{ "Laser tx power high alarm   (Channel 4)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_4_HALARM) },
++	{ "Laser tx power low alarm    (Channel 4)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_4_LALARM) },
++	{ "Laser tx power high warning (Channel 4)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_4_HWARN) },
++	{ "Laser tx power low warning  (Channel 4)",
++		SFF_8636_TX_PWR_34_AW_OFFSET, (SFF_8636_TX_PWR_4_LWARN) },
++
++	{ "Laser rx power high alarm   (Channel 1)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_1_HALARM) },
++	{ "Laser rx power low alarm    (Channel 1)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_1_LALARM) },
++	{ "Laser rx power high warning (Channel 1)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_1_HWARN) },
++	{ "Laser rx power low warning  (Channel 1)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_1_LWARN) },
++
++	{ "Laser rx power high alarm   (Channel 2)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_2_HALARM) },
++	{ "Laser rx power low alarm    (Channel 2)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_2_LALARM) },
++	{ "Laser rx power high warning (Channel 2)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_2_HWARN) },
++	{ "Laser rx power low warning  (Channel 2)",
++		SFF_8636_RX_PWR_12_AW_OFFSET, (SFF_8636_RX_PWR_2_LWARN) },
++
++	{ "Laser rx power high alarm   (Channel 3)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_3_HALARM) },
++	{ "Laser rx power low alarm    (Channel 3)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_3_LALARM) },
++	{ "Laser rx power high warning (Channel 3)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_3_HWARN) },
++	{ "Laser rx power low warning  (Channel 3)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_3_LWARN) },
++
++	{ "Laser rx power high alarm   (Channel 4)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_4_HALARM) },
++	{ "Laser rx power low alarm    (Channel 4)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_4_LALARM) },
++	{ "Laser rx power high warning (Channel 4)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_4_HWARN) },
++	{ "Laser rx power low warning  (Channel 4)",
++		SFF_8636_RX_PWR_34_AW_OFFSET, (SFF_8636_RX_PWR_4_LWARN) },
++
++	{ NULL, 0, 0 },
++};
++
++static void sff_8636_show_identifier(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_identifier(id, SFF_8636_ID_OFFSET, items);
++}
++
++static void sff_8636_show_ext_identifier(const uint8_t *id, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++	printf("%-41s : 0x%02x\n", "Extended identifier",
++			id[SFF_8636_EXT_ID_OFFSET]);
++	sprintf(val_string, "0x%02x", id[SFF_8636_EXT_ID_OFFSET]);
++	add_item_string(items, "Extended identifier", val_string);
++
++	static const char *pfx =
++		"Extended identifier description           :";
++
++	switch (id[SFF_8636_EXT_ID_OFFSET] & SFF_8636_EXT_ID_PWR_CLASS_MASK) {
++	case SFF_8636_EXT_ID_PWR_CLASS_1:
++		printf("%s 1.5W max. Power consumption\n", pfx);
++		add_item_string(items, "Extended identifier description",
++				"1.5W max. Power consumption");
++		break;
++	case SFF_8636_EXT_ID_PWR_CLASS_2:
++		printf("%s 2.0W max. Power consumption\n", pfx);
++		add_item_string(items, "Extended identifier description",
++				"2.0W max. Power consumption");
++		break;
++	case SFF_8636_EXT_ID_PWR_CLASS_3:
++		printf("%s 2.5W max. Power consumption\n", pfx);
++		add_item_string(items, "Extended identifier description",
++				"2.5W max. Power consumption");
++		break;
++	case SFF_8636_EXT_ID_PWR_CLASS_4:
++		printf("%s 3.5W max. Power consumption\n", pfx);
++		add_item_string(items, "Extended identifier description",
++				"3.5W max. Power consumption");
++		break;
++	}
++
++	if (id[SFF_8636_EXT_ID_OFFSET] & SFF_8636_EXT_ID_CDR_TX_MASK) {
++		printf("%s CDR present in TX,", pfx);
++		add_item_string(items, "Extended identifier description",
++				"CDR present in TX");
++	} else {
++		printf("%s No CDR in TX,", pfx);
++		add_item_string(items, "Extended identifier description",
++				"No CDR in TX");
++	}
++
++	if (id[SFF_8636_EXT_ID_OFFSET] & SFF_8636_EXT_ID_CDR_RX_MASK) {
++		printf(" CDR present in RX\n");
++		add_item_string(items, "Extended identifier description",
++				"CDR present in RX");
++	} else {
++		printf(" No CDR in RX\n");
++		add_item_string(items, "Extended identifier description",
++				"No CDR in RX");
++	}
++
++	switch (id[SFF_8636_EXT_ID_OFFSET] & SFF_8636_EXT_ID_EPWR_CLASS_MASK) {
++	case SFF_8636_EXT_ID_PWR_CLASS_LEGACY:
++		printf("%s", pfx);
++		sprintf(val_string, "%s", "");
++		break;
++	case SFF_8636_EXT_ID_PWR_CLASS_5:
++		printf("%s 4.0W max. Power consumption,", pfx);
++		sprintf(val_string, "%s", "4.0W max. Power consumption, ");
++		break;
++	case SFF_8636_EXT_ID_PWR_CLASS_6:
++		printf("%s 4.5W max. Power consumption, ", pfx);
++		sprintf(val_string, "%s", "4.5W max. Power consumption, ");
++		break;
++	case SFF_8636_EXT_ID_PWR_CLASS_7:
++		printf("%s 5.0W max. Power consumption, ", pfx);
++		sprintf(val_string, "%s", "5.0W max. Power consumption, ");
++		break;
++	}
++	if (id[SFF_8636_PWR_MODE_OFFSET] & SFF_8636_HIGH_PWR_ENABLE) {
++		printf(" High Power Class (> 3.5 W) enabled\n");
++		strcat(val_string, "High Power Class (> 3.5 W) enabled");
++	} else {
++		printf(" High Power Class (> 3.5 W) not enabled\n");
++		strcat(val_string, "High Power Class (> 3.5 W) not enabled");
++	}
++	add_item_string(items, "Extended identifier description", val_string);
++}
++
++static void sff_8636_show_connector(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_connector(id, SFF_8636_CTOR_OFFSET, items);
++}
++
++static void sff_8636_show_transceiver(const uint8_t *id, sff_item *items)
++{
++	static const char *pfx =
++		"Transceiver type                          :";
++	static const char *name_string = "Transceiver type";
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",
++	       "Transceiver codes",
++	       id[SFF_8636_ETHERNET_COMP_OFFSET],
++	       id[SFF_8636_SONET_COMP_OFFSET],
++	       id[SFF_8636_SAS_COMP_OFFSET],
++	       id[SFF_8636_GIGE_COMP_OFFSET],
++	       id[SFF_8636_FC_LEN_OFFSET],
++	       id[SFF_8636_FC_TECH_OFFSET],
++	       id[SFF_8636_FC_TRANS_MEDIA_OFFSET],
++	       id[SFF_8636_FC_SPEED_OFFSET]);
++	sprintf(val_string, "0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x",
++		id[SFF_8636_ETHERNET_COMP_OFFSET],
++		id[SFF_8636_SONET_COMP_OFFSET],
++		id[SFF_8636_SAS_COMP_OFFSET],
++		id[SFF_8636_GIGE_COMP_OFFSET],
++		id[SFF_8636_FC_LEN_OFFSET],
++		id[SFF_8636_FC_TECH_OFFSET],
++		id[SFF_8636_FC_TRANS_MEDIA_OFFSET],
++		id[SFF_8636_FC_SPEED_OFFSET]);
++	add_item_string(items, "Transceiver codes", val_string);
++
++	/* 10G/40G Ethernet Compliance Codes */
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_10G_LRM) {
++		printf("%s 10G Ethernet: 10G Base-LRM\n", pfx);
++		add_item_string(items, name_string,
++				"10G Ethernet: 10G Base-LRM");
++	}
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_10G_LR) {
++		printf("%s 10G Ethernet: 10G Base-LR\n", pfx);
++		add_item_string(items, name_string,
++				"10G Ethernet: 10G Base-LR");
++	}
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_10G_SR) {
++		printf("%s 10G Ethernet: 10G Base-SR\n", pfx);
++		add_item_string(items, name_string,
++				"10G Ethernet: 10G Base-SR");
++	}
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_40G_CR4) {
++		printf("%s 40G Ethernet: 40G Base-CR4\n", pfx);
++		add_item_string(items, name_string,
++				"40G Ethernet: 40G Base-CR4");
++	}
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_40G_SR4) {
++		printf("%s 40G Ethernet: 40G Base-SR4\n", pfx);
++		add_item_string(items, name_string,
++				"40G Ethernet: 40G Base-SR4");
++	}
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_40G_LR4) {
++		printf("%s 40G Ethernet: 40G Base-LR4\n", pfx);
++		add_item_string(items, name_string,
++				"40G Ethernet: 40G Base-LR4");
++	}
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_40G_ACTIVE) {
++		printf("%s 40G Ethernet: 40G Active Cable (XLPPI)\n", pfx);
++		add_item_string(items, name_string,
++				"40G Ethernet: 40G Active Cable (XLPPI)");
++	}
++	/* Extended Specification Compliance Codes from SFF-8024 */
++	if (id[SFF_8636_ETHERNET_COMP_OFFSET] & SFF_8636_ETHERNET_RSRVD) {
++		switch (id[SFF_8636_OPTION_1_OFFSET]) {
++		case SFF_8636_ETHERNET_UNSPECIFIED:
++			printf("%s (reserved or unknown)\n", pfx);
++			add_item_string(items, name_string,
++					"(reserved or unknown)");
++			break;
++		case SFF_8636_ETHERNET_100G_AOC:
++			printf("%s 100G Ethernet: 100G AOC or 25GAUI C2M AOC with worst BER of 5x10^(-5)\n",
++					pfx);
++			add_item_string(items, name_string,
++				"100G Ethernet: 100G AOC or 25GAUI C2M AOC with worst BER of 5x10^(-5)");
++			break;
++		case SFF_8636_ETHERNET_100G_SR4:
++			printf("%s 100G Ethernet: 100G Base-SR4 or 25GBase-SR\n",
++					pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G Base-SR4 or 25GBase-SR");
++			break;
++		case SFF_8636_ETHERNET_100G_LR4:
++			printf("%s 100G Ethernet: 100G Base-LR4\n", pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G Base-LR4");
++			break;
++		case SFF_8636_ETHERNET_100G_ER4:
++			printf("%s 100G Ethernet: 100G Base-ER4\n", pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G Base-ER4");
++			break;
++		case SFF_8636_ETHERNET_100G_SR10:
++			printf("%s 100G Ethernet: 100G Base-SR10\n", pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G Base-SR10");
++			break;
++		case SFF_8636_ETHERNET_100G_CWDM4_FEC:
++			printf("%s 100G Ethernet: 100G CWDM4 MSA with FEC\n", pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G CWDM4 MSA with FEC");
++			break;
++		case SFF_8636_ETHERNET_100G_PSM4:
++			printf("%s 100G Ethernet: 100G PSM4 Parallel SMF\n", pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G PSM4 Parallel SMF");
++			break;
++		case SFF_8636_ETHERNET_100G_ACC:
++			printf("%s 100G Ethernet: 100G ACC or 25GAUI C2M ACC with worst BER of 5x10^(-5)\n",
++				pfx);
++			add_item_string(items, name_string,
++				"100G Ethernet: 100G ACC or 25GAUI C2M ACC with worst BER of 5x10^(-5)");
++			break;
++		case SFF_8636_ETHERNET_100G_CWDM4_NO_FEC:
++			printf("%s 100G Ethernet: 100G CWDM4 MSA without FEC\n", pfx);
++			add_item_string(items, name_string,
++				"100G Ethernet: 100G CWDM4 MSA without FEC");
++			break;
++		case SFF_8636_ETHERNET_100G_RSVD1:
++			printf("%s (reserved or unknown)\n", pfx);
++			add_item_string(items, name_string,
++					"(reserved or unknown)");
++			break;
++		case SFF_8636_ETHERNET_100G_CR4:
++			printf("%s 100G Ethernet: 100G Base-CR4 or 25G Base-CR CA-L\n",
++				pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G Base-CR4 or 25G Base-CR CA-L");
++			break;
++		case SFF_8636_ETHERNET_25G_CR_CA_S:
++			printf("%s 25G Ethernet: 25G Base-CR CA-S\n", pfx);
++			add_item_string(items, name_string,
++					"25G Ethernet: 25G Base-CR CA-S");
++			break;
++		case SFF_8636_ETHERNET_25G_CR_CA_N:
++			printf("%s 25G Ethernet: 25G Base-CR CA-N\n", pfx);
++			add_item_string(items, name_string,
++					"25G Ethernet: 25G Base-CR CA-N");
++			break;
++		case SFF_8636_ETHERNET_40G_ER4:
++			printf("%s 40G Ethernet: 40G Base-ER4\n", pfx);
++			add_item_string(items, name_string,
++					"40G Ethernet: 40G Base-ER4");
++			break;
++		case SFF_8636_ETHERNET_4X10_SR:
++			printf("%s 4x10G Ethernet: 10G Base-SR\n", pfx);
++			add_item_string(items, name_string,
++					"4x10G Ethernet: 10G Base-SR");
++			break;
++		case SFF_8636_ETHERNET_40G_PSM4:
++			printf("%s 40G Ethernet: 40G PSM4 Parallel SMF\n", pfx);
++			add_item_string(items, name_string,
++					"40G Ethernet: 40G PSM4 Parallel SMF");
++			break;
++		case SFF_8636_ETHERNET_G959_P1I1_2D1:
++			printf("%s Ethernet: G959.1 profile P1I1-2D1 (10709 MBd, 2km, 1310nm SM)\n",
++					pfx);
++			add_item_string(items, name_string,
++				"Ethernet: G959.1 profile P1I1-2D1 (10709 MBd, 2km, 1310nm SM)");
++			break;
++		case SFF_8636_ETHERNET_G959_P1S1_2D2:
++			printf("%s Ethernet: G959.1 profile P1S1-2D2 (10709 MBd, 40km, 1550nm SM)\n",
++					pfx);
++			add_item_string(items, name_string,
++				"Ethernet: G959.1 profile P1S1-2D2 (10709 MBd, 40km, 1550nm SM)");
++			break;
++		case SFF_8636_ETHERNET_G959_P1L1_2D2:
++			printf("%s Ethernet: G959.1 profile P1L1-2D2 (10709 MBd, 80km, 1550nm SM)\n",
++					pfx);
++			add_item_string(items, name_string,
++				"Ethernet: G959.1 profile P1L1-2D2 (10709 MBd, 80km, 1550nm SM)");
++			break;
++		case SFF_8636_ETHERNET_10GT_SFI:
++			printf("%s 10G Ethernet: 10G Base-T with SFI electrical interface\n",
++					pfx);
++			add_item_string(items, name_string,
++				"10G Ethernet: 10G Base-T with SFI electrical interface");
++			break;
++		case SFF_8636_ETHERNET_100G_CLR4:
++			printf("%s 100G Ethernet: 100G CLR4\n", pfx);
++			add_item_string(items, name_string,
++					"100G Ethernet: 100G CLR4");
++			break;
++		case SFF_8636_ETHERNET_100G_AOC2:
++			printf("%s 100G Ethernet: 100G AOC or 25GAUI C2M AOC with worst BER of 10^(-12)\n",
++					pfx);
++			add_item_string(items, name_string,
++				"100G Ethernet: 100G AOC or 25GAUI C2M AOC with worst BER of 10^(-12)");
++			break;
++		case SFF_8636_ETHERNET_100G_ACC2:
++			printf("%s 100G Ethernet: 100G ACC or 25GAUI C2M ACC with worst BER of 10^(-12)\n",
++					pfx);
++			add_item_string(items, name_string,
++				"100G Ethernet: 100G ACC or 25GAUI C2M ACC with worst BER of 10^(-12)");
++			break;
++		default:
++			printf("%s (reserved or unknown)\n", pfx);
++			add_item_string(items, name_string,
++					"(reserved or unknown)");
++			break;
++		}
++	}
++
++	/* SONET Compliance Codes */
++	if (id[SFF_8636_SONET_COMP_OFFSET] & SFF_8636_SONET_40G_OTN) {
++		printf("%s 40G OTN (OTU3B/OTU3C)\n", pfx);
++		add_item_string(items, name_string, "40G OTN (OTU3B/OTU3C)");
++	}
++	if (id[SFF_8636_SONET_COMP_OFFSET] & SFF_8636_SONET_OC48_LR) {
++		printf("%s SONET: OC-48, long reach\n", pfx);
++		add_item_string(items, name_string, "SONET: OC-48, long reach");
++	}
++	if (id[SFF_8636_SONET_COMP_OFFSET] & SFF_8636_SONET_OC48_IR) {
++		printf("%s SONET: OC-48, intermediate reach\n", pfx);
++		add_item_string(items, name_string, "SONET: OC-48, intermediate reach");
++	}
++	if (id[SFF_8636_SONET_COMP_OFFSET] & SFF_8636_SONET_OC48_SR) {
++		printf("%s SONET: OC-48, short reach\n", pfx);
++		add_item_string(items, name_string, "SONET: OC-48, short reach");
++	}
++
++	/* SAS/SATA Compliance Codes */
++	if (id[SFF_8636_SAS_COMP_OFFSET] & SFF_8636_SAS_6G) {
++		printf("%s SAS 6.0G\n", pfx);
++		add_item_string(items, name_string, "SAS 6.0G");
++	}
++	if (id[SFF_8636_SAS_COMP_OFFSET] & SFF_8636_SAS_3G) {
++		printf("%s SAS 3.0G\n", pfx);
++		add_item_string(items, name_string, "SAS 3.0G");
++	}
++
++	/* Ethernet Compliance Codes */
++	if (id[SFF_8636_GIGE_COMP_OFFSET] & SFF_8636_GIGE_1000_BASE_T) {
++		printf("%s Ethernet: 1000BASE-T\n", pfx);
++		add_item_string(items, name_string, "Ethernet: 1000BASE-T");
++	}
++	if (id[SFF_8636_GIGE_COMP_OFFSET] & SFF_8636_GIGE_1000_BASE_CX) {
++		printf("%s Ethernet: 1000BASE-CX\n", pfx);
++		add_item_string(items, name_string, "Ethernet: 1000BASE-CX");
++	}
++	if (id[SFF_8636_GIGE_COMP_OFFSET] & SFF_8636_GIGE_1000_BASE_LX) {
++		printf("%s Ethernet: 1000BASE-LX\n", pfx);
++		add_item_string(items, name_string, "Ethernet: 1000BASE-LX");
++	}
++	if (id[SFF_8636_GIGE_COMP_OFFSET] & SFF_8636_GIGE_1000_BASE_SX) {
++		printf("%s Ethernet: 1000BASE-SX\n", pfx);
++		add_item_string(items, name_string, "Ethernet: 1000BASE-SX");
++	}
++
++	/* Fibre Channel link length */
++	if (id[SFF_8636_FC_LEN_OFFSET] & SFF_8636_FC_LEN_VERY_LONG) {
++		printf("%s FC: very long distance (V)\n", pfx);
++		add_item_string(items, name_string, "FC: very long distance (V)");
++	}
++	if (id[SFF_8636_FC_LEN_OFFSET] & SFF_8636_FC_LEN_SHORT) {
++		printf("%s FC: short distance (S)\n", pfx);
++		add_item_string(items, name_string, "FC: short distance (S)");
++	}
++	if (id[SFF_8636_FC_LEN_OFFSET] & SFF_8636_FC_LEN_INT) {
++		printf("%s FC: intermediate distance (I)\n", pfx);
++		add_item_string(items, name_string, "FC: intermediate distance (I)");
++	}
++	if (id[SFF_8636_FC_LEN_OFFSET] & SFF_8636_FC_LEN_LONG) {
++		printf("%s FC: long distance (L)\n", pfx);
++		add_item_string(items, name_string, "FC: long distance (L)");
++	}
++	if (id[SFF_8636_FC_LEN_OFFSET] & SFF_8636_FC_LEN_MED) {
++		printf("%s FC: medium distance (M)\n", pfx);
++		add_item_string(items, name_string, "FC: medium distance (M)");
++	}
++
++	/* Fibre Channel transmitter technology */
++	if (id[SFF_8636_FC_LEN_OFFSET] & SFF_8636_FC_TECH_LONG_LC) {
++		printf("%s FC: Longwave laser (LC)\n", pfx);
++		add_item_string(items, name_string, "FC: Longwave laser (LC)");
++	}
++	if (id[SFF_8636_FC_LEN_OFFSET] & SFF_8636_FC_TECH_ELEC_INTER) {
++		printf("%s FC: Electrical inter-enclosure (EL)\n", pfx);
++		add_item_string(items, name_string, "FC: Electrical inter-enclosure (EL)");
++	}
++	if (id[SFF_8636_FC_TECH_OFFSET] & SFF_8636_FC_TECH_ELEC_INTRA) {
++		printf("%s FC: Electrical intra-enclosure (EL)\n", pfx);
++		add_item_string(items, name_string, "FC: Electrical intra-enclosure (EL)");
++	}
++	if (id[SFF_8636_FC_TECH_OFFSET] & SFF_8636_FC_TECH_SHORT_WO_OFC) {
++		printf("%s FC: Shortwave laser w/o OFC (SN)\n", pfx);
++		add_item_string(items, name_string, "FC: Shortwave laser w/o OFC (SN)");
++	}
++	if (id[SFF_8636_FC_TECH_OFFSET] & SFF_8636_FC_TECH_SHORT_W_OFC) {
++		printf("%s FC: Shortwave laser with OFC (SL)\n", pfx);
++		add_item_string(items, name_string, "FC: Shortwave laser with OFC (SL)");
++	}
++	if (id[SFF_8636_FC_TECH_OFFSET] & SFF_8636_FC_TECH_LONG_LL) {
++		printf("%s FC: Longwave laser (LL)\n", pfx);
++		add_item_string(items, name_string, "FC: Longwave laser (LL)");
++	}
++
++	/* Fibre Channel transmission media */
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_TW) {
++		printf("%s FC: Twin Axial Pair (TW)\n", pfx);
++		add_item_string(items, name_string, "FC: Twin Axial Pair (TW)");
++	}
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_TP) {
++		printf("%s FC: Twisted Pair (TP)\n", pfx);
++		add_item_string(items, name_string, "FC: Twisted Pair (TP)");
++	}
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_MI) {
++		printf("%s FC: Miniature Coax (MI)\n", pfx);
++		add_item_string(items, name_string, "FC: Miniature Coax (MI)");
++	}
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_TV) {
++		printf("%s FC: Video Coax (TV)\n", pfx);
++		add_item_string(items, name_string, "FC: Video Coax (TV)");
++	}
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_M6) {
++		printf("%s FC: Multimode, 62.5m (M6)\n", pfx);
++		add_item_string(items, name_string, "FC: Multimode, 62.5m (M6)");
++	}
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_M5) {
++		printf("%s FC: Multimode, 50m (M5)\n", pfx);
++		add_item_string(items, name_string, "FC: Multimode, 50m (M5)");
++	}
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_OM3) {
++		printf("%s FC: Multimode, 50um (OM3)\n", pfx);
++		add_item_string(items, name_string, "FC: Multimode, 50um (OM3)");
++	}
++	if (id[SFF_8636_FC_TRANS_MEDIA_OFFSET] & SFF_8636_FC_TRANS_MEDIA_SM) {
++		printf("%s FC: Single Mode (SM)\n", pfx);
++		add_item_string(items, name_string, "FC: Single Mode (SM)");
++	}
++
++	/* Fibre Channel speed */
++	if (id[SFF_8636_FC_SPEED_OFFSET] & SFF_8636_FC_SPEED_1200_MBPS) {
++		printf("%s FC: 1200 MBytes/sec\n", pfx);
++		add_item_string(items, name_string, "FC: 1200 MBytes/sec");
++	}
++	if (id[SFF_8636_FC_SPEED_OFFSET] & SFF_8636_FC_SPEED_800_MBPS) {
++		printf("%s FC: 800 MBytes/sec\n", pfx);
++		add_item_string(items, name_string, "FC: 800 MBytes/sec");
++	}
++	if (id[SFF_8636_FC_SPEED_OFFSET] & SFF_8636_FC_SPEED_1600_MBPS) {
++		printf("%s FC: 1600 MBytes/sec\n", pfx);
++		add_item_string(items, name_string, "FC: 1600 MBytes/sec");
++	}
++	if (id[SFF_8636_FC_SPEED_OFFSET] & SFF_8636_FC_SPEED_400_MBPS) {
++		printf("%s FC: 400 MBytes/sec\n", pfx);
++		add_item_string(items, name_string, "FC: 400 MBytes/sec");
++	}
++	if (id[SFF_8636_FC_SPEED_OFFSET] & SFF_8636_FC_SPEED_200_MBPS) {
++		printf("%s FC: 200 MBytes/sec\n", pfx);
++		add_item_string(items, name_string, "FC: 200 MBytes/sec");
++	}
++	if (id[SFF_8636_FC_SPEED_OFFSET] & SFF_8636_FC_SPEED_100_MBPS) {
++		printf("%s FC: 100 MBytes/sec\n", pfx);
++		add_item_string(items, name_string, "FC: 100 MBytes/sec");
++	}
++}
++
++static void sff_8636_show_encoding(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_encoding(id, SFF_8636_ENCODING_OFFSET,
++			       RTE_ETH_MODULE_SFF_8636, items);
++}
++
++static void sff_8636_show_rate_identifier(const uint8_t *id, sff_item *items)
++{
++	char val_string[20];
++	/* TODO: Need to fix rate select logic */
++	printf("%-41s : 0x%02x\n", "Rate identifier",
++			id[SFF_8636_EXT_RS_OFFSET]);
++	sprintf(val_string, "0x%02x", id[SFF_8636_EXT_RS_OFFSET]);
++	add_item_string(items, "Rate identifier", val_string);
++}
++
++static void sff_8636_show_oui(const uint8_t *id, sff_item *items)
++{
++	sff_8024_show_oui(id, SFF_8636_VENDOR_OUI_OFFSET, items);
++}
++
++static void sff_8636_show_wavelength_or_copper_compliance(const uint8_t *id, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++	printf("%-41s : 0x%02x", "Transmitter technology",
++		(id[SFF_8636_DEVICE_TECH_OFFSET] & SFF_8636_TRANS_TECH_MASK));
++	sprintf(val_string, "0x%02x",
++		(id[SFF_8636_DEVICE_TECH_OFFSET] & SFF_8636_TRANS_TECH_MASK));
++
++	switch (id[SFF_8636_DEVICE_TECH_OFFSET] & SFF_8636_TRANS_TECH_MASK) {
++	case SFF_8636_TRANS_850_VCSEL:
++		printf(" (850 nm VCSEL)\n");
++		strcat(val_string, " (850 nm VCSEL)");
++		break;
++	case SFF_8636_TRANS_1310_VCSEL:
++		printf(" (1310 nm VCSEL)\n");
++		strcat(val_string, " (1310 nm VCSEL)");
++		break;
++	case SFF_8636_TRANS_1550_VCSEL:
++		printf(" (1550 nm VCSEL)\n");
++		strcat(val_string, " (1550 nm VCSEL)");
++		break;
++	case SFF_8636_TRANS_1310_FP:
++		printf(" (1310 nm FP)\n");
++		strcat(val_string, " (1310 nm FP)");
++		break;
++	case SFF_8636_TRANS_1310_DFB:
++		printf(" (1310 nm DFB)\n");
++		strcat(val_string, " (1310 nm DFB)");
++		break;
++	case SFF_8636_TRANS_1550_DFB:
++		printf(" (1550 nm DFB)\n");
++		strcat(val_string, " (1550 nm DFB)");
++		break;
++	case SFF_8636_TRANS_1310_EML:
++		printf(" (1310 nm EML)\n");
++		strcat(val_string, " (1310 nm EML)");
++		break;
++	case SFF_8636_TRANS_1550_EML:
++		printf(" (1550 nm EML)\n");
++		strcat(val_string, " (1550 nm EML)");
++		break;
++	case SFF_8636_TRANS_OTHERS:
++		printf(" (Others/Undefined)\n");
++		strcat(val_string, " (Others/Undefined)");
++		break;
++	case SFF_8636_TRANS_1490_DFB:
++		printf(" (1490 nm DFB)\n");
++		strcat(val_string, " (1490 nm DFB)");
++		break;
++	case SFF_8636_TRANS_COPPER_PAS_UNEQUAL:
++		printf(" (Copper cable unequalized)\n");
++		strcat(val_string, " (Copper cable unequalized)");
++		break;
++	case SFF_8636_TRANS_COPPER_PAS_EQUAL:
++		printf(" (Copper cable passive equalized)\n");
++		strcat(val_string, " (Copper cable passive equalized)");
++		break;
++	case SFF_8636_TRANS_COPPER_LNR_FAR_EQUAL:
++		printf(" (Copper cable, near and far end limiting active equalizers)\n");
++		strcat(val_string,
++		       " (Copper cable, near and far end limiting active equalizers)");
++		break;
++	case SFF_8636_TRANS_COPPER_FAR_EQUAL:
++		printf(" (Copper cable, far end limiting active equalizers)\n");
++		strcat(val_string, " (Copper cable, far end limiting active equalizers)");
++		break;
++	case SFF_8636_TRANS_COPPER_NEAR_EQUAL:
++		printf(" (Copper cable, near end limiting active equalizers)\n");
++		strcat(val_string, " (Copper cable, near end limiting active equalizers)");
++		break;
++	case SFF_8636_TRANS_COPPER_LNR_EQUAL:
++		printf(" (Copper cable, linear active equalizers)\n");
++		strcat(val_string, " (Copper cable, linear active equalizers)");
++		break;
++	}
++	add_item_string(items, "Transmitter technology", val_string);
++
++	if ((id[SFF_8636_DEVICE_TECH_OFFSET] & SFF_8636_TRANS_TECH_MASK)
++			>= SFF_8636_TRANS_COPPER_PAS_UNEQUAL) {
++		printf("%-41s : %udb\n", "Attenuation at 2.5GHz",
++			id[SFF_8636_WAVELEN_HIGH_BYTE_OFFSET]);
++		sprintf(val_string, "%udb", id[SFF_8636_WAVELEN_HIGH_BYTE_OFFSET]);
++		add_item_string(items, "Attenuation at 2.5GHz", val_string);
++
++		printf("%-41s : %udb\n", "Attenuation at 5.0GHz",
++			id[SFF_8636_WAVELEN_LOW_BYTE_OFFSET]);
++		sprintf(val_string, "%udb", id[SFF_8636_WAVELEN_HIGH_BYTE_OFFSET]);
++		add_item_string(items, "Attenuation at 5.0GHz", val_string);
++
++		printf("%-41s : %udb\n", "Attenuation at 7.0GHz",
++			id[SFF_8636_WAVE_TOL_HIGH_BYTE_OFFSET]);
++		sprintf(val_string, "%udb", id[SFF_8636_WAVELEN_HIGH_BYTE_OFFSET]);
++		add_item_string(items, "Attenuation at 7.0GHz", val_string);
++
++		printf("%-41s : %udb\n", "Attenuation at 12.9GHz",
++			id[SFF_8636_WAVE_TOL_LOW_BYTE_OFFSET]);
++		sprintf(val_string, "%udb", id[SFF_8636_WAVELEN_HIGH_BYTE_OFFSET]);
++		add_item_string(items, "Attenuation at 12.9GHz", val_string);
++	} else {
++		printf("%-41s : %.3lfnm\n", "Laser wavelength",
++			(((id[SFF_8636_WAVELEN_HIGH_BYTE_OFFSET] << 8) |
++			id[SFF_8636_WAVELEN_LOW_BYTE_OFFSET])*0.05));
++		sprintf(val_string, "%.3lfnm",
++			(((id[SFF_8636_WAVELEN_HIGH_BYTE_OFFSET] << 8) |
++			id[SFF_8636_WAVELEN_LOW_BYTE_OFFSET])*0.05));
++		add_item_string(items, "Laser wavelength", val_string);
++
++		printf("%-41s : %.3lfnm\n", "Laser wavelength tolerance",
++			(((id[SFF_8636_WAVE_TOL_HIGH_BYTE_OFFSET] << 8) |
++			id[SFF_8636_WAVE_TOL_LOW_BYTE_OFFSET])*0.005));
++		sprintf(val_string, "%.3lfnm",
++			(((id[SFF_8636_WAVE_TOL_HIGH_BYTE_OFFSET] << 8) |
++			id[SFF_8636_WAVE_TOL_LOW_BYTE_OFFSET])*0.005));
++		add_item_string(items, "Laser wavelength tolerance", val_string);
++	}
++}
++
++static void sff_8636_show_revision_compliance(const uint8_t *id, sff_item *items)
++{
++	static const char *pfx =
++		"Revision Compliance                       :";
++
++	switch (id[SFF_8636_REV_COMPLIANCE_OFFSET]) {
++	case SFF_8636_REV_UNSPECIFIED:
++		printf("%s Revision not specified\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"Revision not specified");
++		break;
++	case SFF_8636_REV_8436_48:
++		printf("%s SFF-8436 Rev 4.8 or earlier\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"SFF-8436 Rev 4.8 or earlier");
++		break;
++	case SFF_8636_REV_8436_8636:
++		printf("%s SFF-8436 Rev 4.8 or earlier\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"SFF-8436 Rev 4.8 or earlier");
++		break;
++	case SFF_8636_REV_8636_13:
++		printf("%s SFF-8636 Rev 1.3 or earlier\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"SFF-8636 Rev 1.3 or earlier");
++		break;
++	case SFF_8636_REV_8636_14:
++		printf("%s SFF-8636 Rev 1.4\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"SFF-8636 Rev 1.4");
++		break;
++	case SFF_8636_REV_8636_15:
++		printf("%s SFF-8636 Rev 1.5\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"SFF-8636 Rev 1.5");
++		break;
++	case SFF_8636_REV_8636_20:
++		printf("%s SFF-8636 Rev 2.0\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"SFF-8636 Rev 2.0");
++		break;
++	case SFF_8636_REV_8636_27:
++		printf("%s SFF-8636 Rev 2.5/2.6/2.7\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"SFF-8636 Rev 2.5/2.6/2.7");
++		break;
++	default:
++		printf("%s Unallocated\n", pfx);
++		add_item_string(items, "Revision Compliance",
++				"Unallocated");
++		break;
++	}
++}
++
++/*
++ * 2-byte internal temperature conversions:
++ * First byte is a signed 8-bit integer, which is the temp decimal part
++ * Second byte are 1/256th of degree, which are added to the dec part.
++ */
++#define SFF_8636_OFFSET_TO_TEMP(offset) ((int16_t)OFFSET_TO_U16(offset))
++
++static void sff_8636_dom_parse(const uint8_t *id, struct sff_diags *sd)
++{
++	int i = 0;
++
++	/* Monitoring Thresholds for Alarms and Warnings */
++	sd->sfp_voltage[MCURR] = OFFSET_TO_U16(SFF_8636_VCC_CURR);
++	sd->sfp_voltage[HALRM] = OFFSET_TO_U16(SFF_8636_VCC_HALRM);
++	sd->sfp_voltage[LALRM] = OFFSET_TO_U16(SFF_8636_VCC_LALRM);
++	sd->sfp_voltage[HWARN] = OFFSET_TO_U16(SFF_8636_VCC_HWARN);
++	sd->sfp_voltage[LWARN] = OFFSET_TO_U16(SFF_8636_VCC_LWARN);
++
++	sd->sfp_temp[MCURR] = SFF_8636_OFFSET_TO_TEMP(SFF_8636_TEMP_CURR);
++	sd->sfp_temp[HALRM] = SFF_8636_OFFSET_TO_TEMP(SFF_8636_TEMP_HALRM);
++	sd->sfp_temp[LALRM] = SFF_8636_OFFSET_TO_TEMP(SFF_8636_TEMP_LALRM);
++	sd->sfp_temp[HWARN] = SFF_8636_OFFSET_TO_TEMP(SFF_8636_TEMP_HWARN);
++	sd->sfp_temp[LWARN] = SFF_8636_OFFSET_TO_TEMP(SFF_8636_TEMP_LWARN);
++
++	sd->bias_cur[HALRM] = OFFSET_TO_U16(SFF_8636_TX_BIAS_HALRM);
++	sd->bias_cur[LALRM] = OFFSET_TO_U16(SFF_8636_TX_BIAS_LALRM);
++	sd->bias_cur[HWARN] = OFFSET_TO_U16(SFF_8636_TX_BIAS_HWARN);
++	sd->bias_cur[LWARN] = OFFSET_TO_U16(SFF_8636_TX_BIAS_LWARN);
++
++	sd->tx_power[HALRM] = OFFSET_TO_U16(SFF_8636_TX_PWR_HALRM);
++	sd->tx_power[LALRM] = OFFSET_TO_U16(SFF_8636_TX_PWR_LALRM);
++	sd->tx_power[HWARN] = OFFSET_TO_U16(SFF_8636_TX_PWR_HWARN);
++	sd->tx_power[LWARN] = OFFSET_TO_U16(SFF_8636_TX_PWR_LWARN);
++
++	sd->rx_power[HALRM] = OFFSET_TO_U16(SFF_8636_RX_PWR_HALRM);
++	sd->rx_power[LALRM] = OFFSET_TO_U16(SFF_8636_RX_PWR_LALRM);
++	sd->rx_power[HWARN] = OFFSET_TO_U16(SFF_8636_RX_PWR_HWARN);
++	sd->rx_power[LWARN] = OFFSET_TO_U16(SFF_8636_RX_PWR_LWARN);
++
++
++	/* Channel Specific Data */
++	for (i = 0; i < MAX_CHANNEL_NUM; i++) {
++		uint8_t rx_power_offset, tx_bias_offset;
++		uint8_t tx_power_offset;
++
++		switch (i) {
++		case 0:
++			rx_power_offset = SFF_8636_RX_PWR_1_OFFSET;
++			tx_power_offset = SFF_8636_TX_PWR_1_OFFSET;
++			tx_bias_offset = SFF_8636_TX_BIAS_1_OFFSET;
++			break;
++		case 1:
++			rx_power_offset = SFF_8636_RX_PWR_2_OFFSET;
++			tx_power_offset = SFF_8636_TX_PWR_2_OFFSET;
++			tx_bias_offset = SFF_8636_TX_BIAS_2_OFFSET;
++			break;
++		case 2:
++			rx_power_offset = SFF_8636_RX_PWR_3_OFFSET;
++			tx_power_offset = SFF_8636_TX_PWR_3_OFFSET;
++			tx_bias_offset = SFF_8636_TX_BIAS_3_OFFSET;
++			break;
++		case 3:
++			rx_power_offset = SFF_8636_RX_PWR_4_OFFSET;
++			tx_power_offset = SFF_8636_TX_PWR_4_OFFSET;
++			tx_bias_offset = SFF_8636_TX_BIAS_4_OFFSET;
++			break;
++		}
++		sd->scd[i].bias_cur = OFFSET_TO_U16(tx_bias_offset);
++		sd->scd[i].rx_power = OFFSET_TO_U16(rx_power_offset);
++		sd->scd[i].tx_power = OFFSET_TO_U16(tx_power_offset);
++	}
++
++}
++
++static void sff_8636_show_dom(const uint8_t *id, uint32_t eeprom_len, sff_item *items)
++{
++	struct sff_diags sd = {0};
++	const char *rx_power_string = NULL;
++	char power_string[MAX_DESC_SIZE];
++	char val_string[TMP_STRING_SIZE];
++	int i;
++
++	/*
++	 * There is no clear identifier to signify the existence of
++	 * optical diagnostics similar to SFF-8472. So checking existence
++	 * of page 3, will provide the gurantee for existence of alarms
++	 * and thresholds
++	 * If pagging support exists, then supports_alarms is marked as 1
++	 */
++
++	if (eeprom_len == RTE_ETH_MODULE_SFF_8636_MAX_LEN) {
++		if (!(id[SFF_8636_STATUS_2_OFFSET] &
++					SFF_8636_STATUS_PAGE_3_PRESENT)) {
++			sd.supports_alarms = 1;
++		}
++	}
++
++	sd.rx_power_type = id[SFF_8636_DIAG_TYPE_OFFSET] &
++						SFF_8636_RX_PWR_TYPE_MASK;
++	sd.tx_power_type = id[SFF_8636_DIAG_TYPE_OFFSET] &
++						SFF_8636_RX_PWR_TYPE_MASK;
++
++	sff_8636_dom_parse(id, &sd);
++
++	PRINT_TEMP("Module temperature", sd.sfp_temp[MCURR]);
++	SPRINT_TEMP(val_string, sd.sfp_temp[MCURR]);
++	add_item_string(items, "Module temperature", val_string);
++
++	PRINT_VCC("Module voltage", sd.sfp_voltage[MCURR]);
++	SPRINT_VCC(val_string, sd.sfp_voltage[MCURR]);
++	add_item_string(items, "Module voltage", val_string);
++
++	/*
++	 * SFF-8636/8436 spec is not clear whether RX power/ TX bias
++	 * current fields are supported or not. A valid temperature
++	 * reading is used as existence for TX/RX power.
++	 */
++	if ((sd.sfp_temp[MCURR] == 0x0) ||
++	    (sd.sfp_temp[MCURR] == (int16_t)0xFFFF))
++		return;
++
++	printf("%-41s : %s\n", "Alarm/warning flags implemented",
++		(sd.supports_alarms ? "Yes" : "No"));
++	add_item_string(items, "Alarm/warning flags implemented",
++			(sd.supports_alarms ? "Yes" : "No"));
++
++	for (i = 0; i < MAX_CHANNEL_NUM; i++) {
++		snprintf(power_string, MAX_DESC_SIZE, "%s (Channel %d)",
++					"Laser tx bias current", i+1);
++		PRINT_BIAS(power_string, sd.scd[i].bias_cur);
++		SPRINT_BIAS(val_string, sd.scd[i].bias_cur);
++		add_item_string(items, power_string, val_string);
++	}
++
++	for (i = 0; i < MAX_CHANNEL_NUM; i++) {
++		snprintf(power_string, MAX_DESC_SIZE, "%s (Channel %d)",
++					"Transmit avg optical power", i+1);
++		PRINT_xX_PWR(power_string, sd.scd[i].tx_power);
++		SPRINT_xX_PWR(val_string, sd.scd[i].tx_power);
++		add_item_string(items, power_string, val_string);
++	}
++
++	if (!sd.rx_power_type)
++		rx_power_string = "Receiver signal OMA";
++	else
++		rx_power_string = "Rcvr signal avg optical power";
++
++	for (i = 0; i < MAX_CHANNEL_NUM; i++) {
++		snprintf(power_string, MAX_DESC_SIZE, "%s(Channel %d)",
++					rx_power_string, i+1);
++		PRINT_xX_PWR(power_string, sd.scd[i].rx_power);
++		SPRINT_xX_PWR(val_string, sd.scd[i].rx_power);
++		add_item_string(items, power_string, val_string);
++	}
++
++	if (sd.supports_alarms) {
++		for (i = 0; sff_8636_aw_flags[i].str; ++i) {
++			printf("%-41s : %s\n", sff_8636_aw_flags[i].str,
++			       id[sff_8636_aw_flags[i].offset]
++			       & sff_8636_aw_flags[i].value ? "On" : "Off");
++			add_item_string(items, sff_8636_aw_flags[i].str,
++					id[sff_8636_aw_flags[i].offset]
++					& sff_8636_aw_flags[i].value ? "On" : "Off");
++		}
++
++		sff_show_thresholds(sd, items);
++	}
++
++}
++void sff_8636_show_all(const uint8_t *id, uint32_t eeprom_len, sff_item *items)
++{
++	sff_8636_show_identifier(id, items);
++	if ((id[SFF_8636_ID_OFFSET] == SFF_8024_ID_QSFP) ||
++		(id[SFF_8636_ID_OFFSET] == SFF_8024_ID_QSFP_PLUS) ||
++		(id[SFF_8636_ID_OFFSET] == SFF_8024_ID_QSFP28)) {
++		sff_8636_show_ext_identifier(id, items);
++		sff_8636_show_connector(id, items);
++		sff_8636_show_transceiver(id, items);
++		sff_8636_show_encoding(id, items);
++		sff_show_value_with_unit(id, SFF_8636_BR_NOMINAL_OFFSET,
++				"BR, Nominal", 100, "Mbps", items);
++		sff_8636_show_rate_identifier(id, items);
++		sff_show_value_with_unit(id, SFF_8636_SM_LEN_OFFSET,
++			     "Length (SMF,km)", 1, "km", items);
++		sff_show_value_with_unit(id, SFF_8636_OM3_LEN_OFFSET,
++				"Length (OM3 50um)", 2, "m", items);
++		sff_show_value_with_unit(id, SFF_8636_OM2_LEN_OFFSET,
++				"Length (OM2 50um)", 1, "m", items);
++		sff_show_value_with_unit(id, SFF_8636_OM1_LEN_OFFSET,
++			     "Length (OM1 62.5um)", 1, "m", items);
++		sff_show_value_with_unit(id, SFF_8636_CBL_LEN_OFFSET,
++			     "Length (Copper or Active cable)", 1, "m", items);
++		sff_8636_show_wavelength_or_copper_compliance(id, items);
++		sff_show_ascii(id, SFF_8636_VENDOR_NAME_START_OFFSET,
++			     SFF_8636_VENDOR_NAME_END_OFFSET, "Vendor name", items);
++		sff_8636_show_oui(id, items);
++		sff_show_ascii(id, SFF_8636_VENDOR_PN_START_OFFSET,
++			     SFF_8636_VENDOR_PN_END_OFFSET, "Vendor PN", items);
++		sff_show_ascii(id, SFF_8636_VENDOR_REV_START_OFFSET,
++			     SFF_8636_VENDOR_REV_END_OFFSET, "Vendor rev", items);
++		sff_show_ascii(id, SFF_8636_VENDOR_SN_START_OFFSET,
++			     SFF_8636_VENDOR_SN_END_OFFSET, "Vendor SN", items);
++		sff_show_ascii(id, SFF_8636_DATE_YEAR_OFFSET,
++			     SFF_8636_DATE_VENDOR_LOT_OFFSET + 1, "Date code", items);
++		sff_8636_show_revision_compliance(id, items);
++		sff_8636_show_dom(id, eeprom_len, items);
++	}
++}
+diff --git a/drivers/common/sff_module/sff_8636.h b/drivers/common/sff_module/sff_8636.h
+new file mode 100644
+index 0000000000..d19e6c744e
+--- /dev/null
++++ b/drivers/common/sff_module/sff_8636.h
+@@ -0,0 +1,592 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2022 Intel Corporation
++ *
++ * SFF-8636 standards based QSFP EEPROM Field Definitions
++ *
++ */
++
++#ifndef SFF_8636_H__
++#define SFF_8636_H__
++
++/*------------------------------------------------------------------------------
++ *
++ * QSFP EEPROM data structures
++ *
++ * register info from SFF-8636 Rev 2.7
++ */
++
++/*------------------------------------------------------------------------------
++ *
++ * Lower Memory Page 00h
++ * Measurement, Diagnostic and Control Functions
++ *
++ */
++/* Identifier - 0 */
++/* Values are defined under SFF_8024_ID_OFFSET */
++#define	SFF_8636_ID_OFFSET	0x00
++
++#define	SFF_8636_REV_COMPLIANCE_OFFSET	0x01
++#define	SFF_8636_REV_UNSPECIFIED		0x00
++#define	SFF_8636_REV_8436_48			0x01
++#define	SFF_8636_REV_8436_8636			0x02
++#define	SFF_8636_REV_8636_13			0x03
++#define	SFF_8636_REV_8636_14			0x04
++#define	SFF_8636_REV_8636_15			0x05
++#define	SFF_8636_REV_8636_20			0x06
++#define	SFF_8636_REV_8636_27			0x07
++
++#define	SFF_8636_STATUS_2_OFFSET	0x02
++/* Flat Memory:0- Paging, 1- Page 0 only */
++#define	SFF_8636_STATUS_PAGE_3_PRESENT		(1 << 2)
++#define	SFF_8636_STATUS_INTL_OUTPUT		(1 << 1)
++#define	SFF_8636_STATUS_DATA_NOT_READY		(1 << 0)
++
++/* Channel Status Interrupt Flags - 3-5 */
++#define	SFF_8636_LOS_AW_OFFSET	0x03
++#define	SFF_8636_TX4_LOS_AW		(1 << 7)
++#define	SFF_8636_TX3_LOS_AW		(1 << 6)
++#define	SFF_8636_TX2_LOS_AW		(1 << 5)
++#define	SFF_8636_TX1_LOS_AW		(1 << 4)
++#define	SFF_8636_RX4_LOS_AW		(1 << 3)
++#define	SFF_8636_RX3_LOS_AW		(1 << 2)
++#define	SFF_8636_RX2_LOS_AW		(1 << 1)
++#define	SFF_8636_RX1_LOS_AW		(1 << 0)
++
++#define	SFF_8636_FAULT_AW_OFFSET	0x04
++#define	SFF_8636_TX4_FAULT_AW	(1 << 3)
++#define	SFF_8636_TX3_FAULT_AW	(1 << 2)
++#define	SFF_8636_TX2_FAULT_AW	(1 << 1)
++#define	SFF_8636_TX1_FAULT_AW	(1 << 0)
++
++/* Module Monitor Interrupt Flags - 6-8 */
++#define	SFF_8636_TEMP_AW_OFFSET	0x06
++#define	SFF_8636_TEMP_HALARM_STATUS		(1 << 7)
++#define	SFF_8636_TEMP_LALARM_STATUS		(1 << 6)
++#define	SFF_8636_TEMP_HWARN_STATUS		(1 << 5)
++#define	SFF_8636_TEMP_LWARN_STATUS		(1 << 4)
++
++#define	SFF_8636_VCC_AW_OFFSET	0x07
++#define	SFF_8636_VCC_HALARM_STATUS		(1 << 7)
++#define	SFF_8636_VCC_LALARM_STATUS		(1 << 6)
++#define	SFF_8636_VCC_HWARN_STATUS		(1 << 5)
++#define	SFF_8636_VCC_LWARN_STATUS		(1 << 4)
++
++/* Channel Monitor Interrupt Flags - 9-21 */
++#define	SFF_8636_RX_PWR_12_AW_OFFSET	0x09
++#define	SFF_8636_RX_PWR_1_HALARM		(1 << 7)
++#define	SFF_8636_RX_PWR_1_LALARM		(1 << 6)
++#define	SFF_8636_RX_PWR_1_HWARN			(1 << 5)
++#define	SFF_8636_RX_PWR_1_LWARN			(1 << 4)
++#define	SFF_8636_RX_PWR_2_HALARM		(1 << 3)
++#define	SFF_8636_RX_PWR_2_LALARM		(1 << 2)
++#define	SFF_8636_RX_PWR_2_HWARN			(1 << 1)
++#define	SFF_8636_RX_PWR_2_LWARN			(1 << 0)
++
++#define	SFF_8636_RX_PWR_34_AW_OFFSET	0x0A
++#define	SFF_8636_RX_PWR_3_HALARM		(1 << 7)
++#define	SFF_8636_RX_PWR_3_LALARM		(1 << 6)
++#define	SFF_8636_RX_PWR_3_HWARN			(1 << 5)
++#define	SFF_8636_RX_PWR_3_LWARN			(1 << 4)
++#define	SFF_8636_RX_PWR_4_HALARM		(1 << 3)
++#define	SFF_8636_RX_PWR_4_LALARM		(1 << 2)
++#define	SFF_8636_RX_PWR_4_HWARN			(1 << 1)
++#define	SFF_8636_RX_PWR_4_LWARN			(1 << 0)
++
++#define	SFF_8636_TX_BIAS_12_AW_OFFSET	0x0B
++#define	SFF_8636_TX_BIAS_1_HALARM		(1 << 7)
++#define	SFF_8636_TX_BIAS_1_LALARM		(1 << 6)
++#define	SFF_8636_TX_BIAS_1_HWARN		(1 << 5)
++#define	SFF_8636_TX_BIAS_1_LWARN		(1 << 4)
++#define	SFF_8636_TX_BIAS_2_HALARM		(1 << 3)
++#define	SFF_8636_TX_BIAS_2_LALARM		(1 << 2)
++#define	SFF_8636_TX_BIAS_2_HWARN		(1 << 1)
++#define	SFF_8636_TX_BIAS_2_LWARN		(1 << 0)
++
++#define	SFF_8636_TX_BIAS_34_AW_OFFSET	0xC
++#define	SFF_8636_TX_BIAS_3_HALARM		(1 << 7)
++#define	SFF_8636_TX_BIAS_3_LALARM		(1 << 6)
++#define	SFF_8636_TX_BIAS_3_HWARN		(1 << 5)
++#define	SFF_8636_TX_BIAS_3_LWARN		(1 << 4)
++#define	SFF_8636_TX_BIAS_4_HALARM		(1 << 3)
++#define	SFF_8636_TX_BIAS_4_LALARM		(1 << 2)
++#define	SFF_8636_TX_BIAS_4_HWARN		(1 << 1)
++#define	SFF_8636_TX_BIAS_4_LWARN		(1 << 0)
++
++#define	SFF_8636_TX_PWR_12_AW_OFFSET	0x0D
++#define	SFF_8636_TX_PWR_1_HALARM		(1 << 7)
++#define	SFF_8636_TX_PWR_1_LALARM		(1 << 6)
++#define	SFF_8636_TX_PWR_1_HWARN			(1 << 5)
++#define	SFF_8636_TX_PWR_1_LWARN			(1 << 4)
++#define	SFF_8636_TX_PWR_2_HALARM		(1 << 3)
++#define	SFF_8636_TX_PWR_2_LALARM		(1 << 2)
++#define	SFF_8636_TX_PWR_2_HWARN			(1 << 1)
++#define	SFF_8636_TX_PWR_2_LWARN			(1 << 0)
++
++#define	SFF_8636_TX_PWR_34_AW_OFFSET	0x0E
++#define	SFF_8636_TX_PWR_3_HALARM		(1 << 7)
++#define	SFF_8636_TX_PWR_3_LALARM		(1 << 6)
++#define	SFF_8636_TX_PWR_3_HWARN			(1 << 5)
++#define	SFF_8636_TX_PWR_3_LWARN			(1 << 4)
++#define	SFF_8636_TX_PWR_4_HALARM		(1 << 3)
++#define	SFF_8636_TX_PWR_4_LALARM		(1 << 2)
++#define	SFF_8636_TX_PWR_4_HWARN			(1 << 1)
++#define	SFF_8636_TX_PWR_4_LWARN			(1 << 0)
++
++/* Module Monitoring Values - 22-33 */
++#define	SFF_8636_TEMP_CURR		0x16
++#define	SFF_8636_TEMP_MSB_OFFSET		0x16
++#define	SFF_8636_TEMP_LSB_OFFSET		0x17
++
++#define	SFF_8636_VCC_CURR		0x1A
++#define	SFF_8636_VCC_MSB_OFFSET		0x1A
++#define	SFF_8636_VCC_LSB_OFFSET		0x1B
++
++/* Channel Monitoring Values - 34-81 */
++#define	SFF_8636_RX_PWR_1_OFFSET		0x22
++#define	SFF_8636_RX_PWR_2_OFFSET		0x24
++#define	SFF_8636_RX_PWR_3_OFFSET		0x26
++#define	SFF_8636_RX_PWR_4_OFFSET		0x28
++
++#define	SFF_8636_TX_BIAS_1_OFFSET	0x2A
++#define	SFF_8636_TX_BIAS_2_OFFSET	0x2C
++#define	SFF_8636_TX_BIAS_3_OFFSET	0x2E
++#define	SFF_8636_TX_BIAS_4_OFFSET	0x30
++
++#define	SFF_8636_TX_PWR_1_OFFSET		0x32
++#define	SFF_8636_TX_PWR_2_OFFSET		0x34
++#define	SFF_8636_TX_PWR_3_OFFSET		0x36
++#define	SFF_8636_TX_PWR_4_OFFSET		0x38
++
++/* Control Bytes - 86 - 99 */
++#define	SFF_8636_TX_DISABLE_OFFSET	0x56
++#define	SFF_8636_TX_DISABLE_4			(1 << 3)
++#define	SFF_8636_TX_DISABLE_3			(1 << 2)
++#define	SFF_8636_TX_DISABLE_2			(1 << 1)
++#define	SFF_8636_TX_DISABLE_1			(1 << 0)
++
++#define	SFF_8636_RX_RATE_SELECT_OFFSET	0x57
++#define	SFF_8636_RX_RATE_SELECT_4_MASK		(3 << 6)
++#define	SFF_8636_RX_RATE_SELECT_3_MASK		(3 << 4)
++#define	SFF_8636_RX_RATE_SELECT_2_MASK		(3 << 2)
++#define	SFF_8636_RX_RATE_SELECT_1_MASK		(3 << 0)
++
++#define	SFF_8636_TX_RATE_SELECT_OFFSET	0x58
++#define	SFF_8636_TX_RATE_SELECT_4_MASK		(3 << 6)
++#define	SFF_8636_TX_RATE_SELECT_3_MASK		(3 << 4)
++#define	SFF_8636_TX_RATE_SELECT_2_MASK		(3 << 2)
++#define	SFF_8636_TX_RATE_SELECT_1_MASK		(3 << 0)
++
++#define	SFF_8636_RX_APP_SELECT_4_OFFSET	0x58
++#define	SFF_8636_RX_APP_SELECT_3_OFFSET	0x59
++#define	SFF_8636_RX_APP_SELECT_2_OFFSET	0x5A
++#define	SFF_8636_RX_APP_SELECT_1_OFFSET	0x5B
++
++#define	SFF_8636_PWR_MODE_OFFSET		0x5D
++#define	SFF_8636_HIGH_PWR_ENABLE		(1 << 2)
++#define	SFF_8636_LOW_PWR_MODE			(1 << 1)
++#define	SFF_8636_PWR_OVERRIDE			(1 << 0)
++
++#define	SFF_8636_TX_APP_SELECT_4_OFFSET	0x5E
++#define	SFF_8636_TX_APP_SELECT_3_OFFSET	0x5F
++#define	SFF_8636_TX_APP_SELECT_2_OFFSET	0x60
++#define	SFF_8636_TX_APP_SELECT_1_OFFSET	0x61
++
++#define	SFF_8636_LOS_MASK_OFFSET		0x64
++#define	SFF_8636_TX_LOS_4_MASK			(1 << 7)
++#define	SFF_8636_TX_LOS_3_MASK			(1 << 6)
++#define	SFF_8636_TX_LOS_2_MASK			(1 << 5)
++#define	SFF_8636_TX_LOS_1_MASK			(1 << 4)
++#define	SFF_8636_RX_LOS_4_MASK			(1 << 3)
++#define	SFF_8636_RX_LOS_3_MASK			(1 << 2)
++#define	SFF_8636_RX_LOS_2_MASK			(1 << 1)
++#define	SFF_8636_RX_LOS_1_MASK			(1 << 0)
++
++#define	SFF_8636_FAULT_MASK_OFFSET	0x65
++#define	SFF_8636_TX_FAULT_1_MASK		(1 << 3)
++#define	SFF_8636_TX_FAULT_2_MASK		(1 << 2)
++#define	SFF_8636_TX_FAULT_3_MASK		(1 << 1)
++#define	SFF_8636_TX_FAULT_4_MASK		(1 << 0)
++
++#define	SFF_8636_TEMP_MASK_OFFSET	0x67
++#define	SFF_8636_TEMP_HALARM_MASK		(1 << 7)
++#define	SFF_8636_TEMP_LALARM_MASK		(1 << 6)
++#define	SFF_8636_TEMP_HWARN_MASK		(1 << 5)
++#define	SFF_8636_TEMP_LWARN_MASK		(1 << 4)
++
++#define	SFF_8636_VCC_MASK_OFFSET		0x68
++#define	SFF_8636_VCC_HALARM_MASK		(1 << 7)
++#define	SFF_8636_VCC_LALARM_MASK		(1 << 6)
++#define	SFF_8636_VCC_HWARN_MASK			(1 << 5)
++#define	SFF_8636_VCC_LWARN_MASK			(1 << 4)
++
++/*------------------------------------------------------------------------------
++ *
++ * Upper Memory Page 00h
++ * Serial ID - Base ID, Extended ID and Vendor Specific ID fields
++ *
++ */
++/* Identifier - 128 */
++/* Identifier values same as Lower Memory Page 00h */
++#define	SFF_8636_UPPER_PAGE_0_ID_OFFSET		0x80
++
++/* Extended Identifier - 128 */
++#define SFF_8636_EXT_ID_OFFSET		0x81
++#define	SFF_8636_EXT_ID_PWR_CLASS_MASK		0xC0
++#define	SFF_8636_EXT_ID_PWR_CLASS_1		(0 << 6)
++#define	SFF_8636_EXT_ID_PWR_CLASS_2		(1 << 6)
++#define	SFF_8636_EXT_ID_PWR_CLASS_3		(2 << 6)
++#define	SFF_8636_EXT_ID_PWR_CLASS_4		(3 << 6)
++#define	SFF_8636_EXT_ID_CLIE_MASK		0x10
++#define	SFF_8636_EXT_ID_CLIEI_CODE_PRESENT	(1 << 4)
++#define	SFF_8636_EXT_ID_CDR_TX_MASK		0x08
++#define	SFF_8636_EXT_ID_CDR_TX_PRESENT		(1 << 3)
++#define	SFF_8636_EXT_ID_CDR_RX_MASK		0x04
++#define	SFF_8636_EXT_ID_CDR_RX_PRESENT		(1 << 2)
++#define	SFF_8636_EXT_ID_EPWR_CLASS_MASK		0x03
++#define	SFF_8636_EXT_ID_PWR_CLASS_LEGACY	0
++#define	SFF_8636_EXT_ID_PWR_CLASS_5		1
++#define	SFF_8636_EXT_ID_PWR_CLASS_6		2
++#define	SFF_8636_EXT_ID_PWR_CLASS_7		3
++
++/* Connector Values offset - 130 */
++/* Values are defined under SFF_8024_CTOR */
++#define	SFF_8636_CTOR_OFFSET		0x82
++#define	SFF_8636_CTOR_UNKNOWN			0x00
++#define	SFF_8636_CTOR_SC			0x01
++#define	SFF_8636_CTOR_FC_STYLE_1		0x02
++#define	SFF_8636_CTOR_FC_STYLE_2		0x03
++#define	SFF_8636_CTOR_BNC_TNC			0x04
++#define	SFF_8636_CTOR_FC_COAX			0x05
++#define	SFF_8636_CTOR_FIBER_JACK		0x06
++#define	SFF_8636_CTOR_LC			0x07
++#define	SFF_8636_CTOR_MT_RJ			0x08
++#define	SFF_8636_CTOR_MU			0x09
++#define	SFF_8636_CTOR_SG			0x0A
++#define	SFF_8636_CTOR_OPT_PT			0x0B
++#define	SFF_8636_CTOR_MPO			0x0C
++/* 0D-1Fh --- Reserved */
++#define	SFF_8636_CTOR_HSDC_II			0x20
++#define	SFF_8636_CTOR_COPPER_PT			0x21
++#define	SFF_8636_CTOR_RJ45			0x22
++#define	SFF_8636_CTOR_NO_SEPARABLE		0x23
++#define	SFF_8636_CTOR_MXC_2X16			0x24
++
++/* Specification Compliance - 131-138 */
++/* Ethernet Compliance Codes - 131 */
++#define	SFF_8636_ETHERNET_COMP_OFFSET	0x83
++#define	SFF_8636_ETHERNET_RSRVD			(1 << 7)
++#define	SFF_8636_ETHERNET_10G_LRM		(1 << 6)
++#define	SFF_8636_ETHERNET_10G_LR		(1 << 5)
++#define	SFF_8636_ETHERNET_10G_SR		(1 << 4)
++#define	SFF_8636_ETHERNET_40G_CR4		(1 << 3)
++#define	SFF_8636_ETHERNET_40G_SR4		(1 << 2)
++#define	SFF_8636_ETHERNET_40G_LR4		(1 << 1)
++#define	SFF_8636_ETHERNET_40G_ACTIVE	(1 << 0)
++
++/* SONET Compliance Codes - 132 */
++#define	SFF_8636_SONET_COMP_OFFSET	0x84
++#define	SFF_8636_SONET_40G_OTN			(1 << 3)
++#define	SFF_8636_SONET_OC48_LR			(1 << 2)
++#define	SFF_8636_SONET_OC48_IR			(1 << 1)
++#define	SFF_8636_SONET_OC48_SR			(1 << 0)
++
++/* SAS/SATA Complaince Codes - 133 */
++#define	SFF_8636_SAS_COMP_OFFSET		0x85
++#define	SFF_8636_SAS_12G			(1 << 6)
++#define	SFF_8636_SAS_6G				(1 << 5)
++#define	SFF_8636_SAS_3G				(1 << 4)
++
++/* Gigabit Ethernet Compliance Codes - 134 */
++#define	SFF_8636_GIGE_COMP_OFFSET	0x86
++#define	SFF_8636_GIGE_1000_BASE_T		(1 << 3)
++#define	SFF_8636_GIGE_1000_BASE_CX		(1 << 2)
++#define	SFF_8636_GIGE_1000_BASE_LX		(1 << 1)
++#define	SFF_8636_GIGE_1000_BASE_SX		(1 << 0)
++
++/* Fibre Channel Link length/Transmitter Tech. - 135,136 */
++#define	SFF_8636_FC_LEN_OFFSET		0x87
++#define	SFF_8636_FC_LEN_VERY_LONG		(1 << 7)
++#define	SFF_8636_FC_LEN_SHORT			(1 << 6)
++#define	SFF_8636_FC_LEN_INT			(1 << 5)
++#define	SFF_8636_FC_LEN_LONG			(1 << 4)
++#define	SFF_8636_FC_LEN_MED			(1 << 3)
++#define	SFF_8636_FC_TECH_LONG_LC		(1 << 1)
++#define	SFF_8636_FC_TECH_ELEC_INTER		(1 << 0)
++
++#define	SFF_8636_FC_TECH_OFFSET		0x88
++#define	SFF_8636_FC_TECH_ELEC_INTRA		(1 << 7)
++#define	SFF_8636_FC_TECH_SHORT_WO_OFC		(1 << 6)
++#define	SFF_8636_FC_TECH_SHORT_W_OFC		(1 << 5)
++#define	SFF_8636_FC_TECH_LONG_LL		(1 << 4)
++
++/* Fibre Channel Transmitter Media - 137 */
++#define	SFF_8636_FC_TRANS_MEDIA_OFFSET	0x89
++/* Twin Axial Pair */
++#define	SFF_8636_FC_TRANS_MEDIA_TW		(1 << 7)
++/* Shielded Twisted Pair */
++#define	SFF_8636_FC_TRANS_MEDIA_TP		(1 << 6)
++/* Miniature Coax */
++#define	SFF_8636_FC_TRANS_MEDIA_MI		(1 << 5)
++/* Video Coax */
++#define	SFF_8636_FC_TRANS_MEDIA_TV		(1 << 4)
++/* Multi-mode 62.5m */
++#define	SFF_8636_FC_TRANS_MEDIA_M6		(1 << 3)
++/* Multi-mode 50m */
++#define	SFF_8636_FC_TRANS_MEDIA_M5		(1 << 2)
++/* Multi-mode 50um */
++#define	SFF_8636_FC_TRANS_MEDIA_OM3		(1 << 1)
++/* Single Mode */
++#define	SFF_8636_FC_TRANS_MEDIA_SM		(1 << 0)
++
++/* Fibre Channel Speed - 138 */
++#define	SFF_8636_FC_SPEED_OFFSET		0x8A
++#define	SFF_8636_FC_SPEED_1200_MBPS		(1 << 7)
++#define	SFF_8636_FC_SPEED_800_MBPS		(1 << 6)
++#define	SFF_8636_FC_SPEED_1600_MBPS		(1 << 5)
++#define	SFF_8636_FC_SPEED_400_MBPS		(1 << 4)
++#define	SFF_8636_FC_SPEED_200_MBPS		(1 << 2)
++#define	SFF_8636_FC_SPEED_100_MBPS		(1 << 0)
++
++/* Encoding - 139 */
++/* Values are defined under SFF_8024_ENCODING */
++#define	SFF_8636_ENCODING_OFFSET		0x8B
++#define	SFF_8636_ENCODING_MANCHESTER	0x06
++#define	SFF_8636_ENCODING_64B66B		0x05
++#define	SFF_8636_ENCODING_SONET			0x04
++#define	SFF_8636_ENCODING_NRZ			0x03
++#define	SFF_8636_ENCODING_4B5B			0x02
++#define	SFF_8636_ENCODING_8B10B			0x01
++#define	SFF_8636_ENCODING_UNSPEC		0x00
++
++/* BR, Nominal - 140 */
++#define	SFF_8636_BR_NOMINAL_OFFSET	0x8C
++
++/* Extended RateSelect - 141 */
++#define	SFF_8636_EXT_RS_OFFSET		0x8D
++#define	SFF_8636_EXT_RS_V1			(1 << 0)
++
++/* Length (Standard SM Fiber)-km - 142 */
++#define	SFF_8636_SM_LEN_OFFSET		0x8E
++
++/* Length (OM3)-Unit 2m - 143 */
++#define	SFF_8636_OM3_LEN_OFFSET		0x8F
++
++/* Length (OM2)-Unit 1m - 144 */
++#define	SFF_8636_OM2_LEN_OFFSET		0x90
++
++/* Length (OM1)-Unit 1m - 145 */
++#define	SFF_8636_OM1_LEN_OFFSET		0x91
++
++/* Cable Assembly Length -Unit 1m - 146 */
++#define	SFF_8636_CBL_LEN_OFFSET		0x92
++
++/* Device Technology - 147 */
++#define	SFF_8636_DEVICE_TECH_OFFSET	0x93
++/* Transmitter Technology */
++#define	SFF_8636_TRANS_TECH_MASK		0xF0
++/* Copper cable, linear active equalizers */
++#define	SFF_8636_TRANS_COPPER_LNR_EQUAL		(15 << 4)
++/* Copper cable, near end limiting active equalizers */
++#define	SFF_8636_TRANS_COPPER_NEAR_EQUAL	(14 << 4)
++/* Copper cable, far end limiting active equalizers */
++#define	SFF_8636_TRANS_COPPER_FAR_EQUAL		(13 << 4)
++/* Copper cable, near & far end limiting active equalizers */
++#define	SFF_8636_TRANS_COPPER_LNR_FAR_EQUAL	(12 << 4)
++/* Copper cable, passive equalized */
++#define	SFF_8636_TRANS_COPPER_PAS_EQUAL		(11 << 4)
++/* Copper cable, unequalized */
++#define	SFF_8636_TRANS_COPPER_PAS_UNEQUAL	(10 << 4)
++/* 1490 nm DFB */
++#define	SFF_8636_TRANS_1490_DFB			(9 << 4)
++/* Others */
++#define	SFF_8636_TRANS_OTHERS			(8 << 4)
++/* 1550 nm EML */
++#define	SFF_8636_TRANS_1550_EML			(7 << 4)
++/* 1310 nm EML */
++#define	SFF_8636_TRANS_1310_EML			(6 << 4)
++/* 1550 nm DFB */
++#define	SFF_8636_TRANS_1550_DFB			(5 << 4)
++/* 1310 nm DFB */
++#define	SFF_8636_TRANS_1310_DFB			(4 << 4)
++/* 1310 nm FP */
++#define	SFF_8636_TRANS_1310_FP			(3 << 4)
++/* 1550 nm VCSEL */
++#define	SFF_8636_TRANS_1550_VCSEL		(2 << 4)
++/* 1310 nm VCSEL */
++#define	SFF_8636_TRANS_1310_VCSEL		(1 << 4)
++/* 850 nm VCSEL */
++#define	SFF_8636_TRANS_850_VCSEL		(0 << 4)
++
++ /* Active/No wavelength control */
++#define	SFF_8636_DEV_TECH_ACTIVE_WAVE_LEN	(1 << 3)
++/* Cooled transmitter */
++#define	SFF_8636_DEV_TECH_COOL_TRANS		(1 << 2)
++/* APD/Pin Detector */
++#define	SFF_8636_DEV_TECH_APD_DETECTOR		(1 << 1)
++/* Transmitter tunable */
++#define	SFF_8636_DEV_TECH_TUNABLE		(1 << 0)
++
++/* Vendor Name - 148-163 */
++#define	SFF_8636_VENDOR_NAME_START_OFFSET	0x94
++#define	SFF_8636_VENDOR_NAME_END_OFFSET		0xA3
++
++/* Extended Module Codes - 164 */
++#define	SFF_8636_EXT_MOD_CODE_OFFSET	0xA4
++#define	SFF_8636_EXT_MOD_INFINIBAND_EDR	(1 << 4)
++#define	SFF_8636_EXT_MOD_INFINIBAND_FDR	(1 << 3)
++#define	SFF_8636_EXT_MOD_INFINIBAND_QDR	(1 << 2)
++#define	SFF_8636_EXT_MOD_INFINIBAND_DDR	(1 << 1)
++#define	SFF_8636_EXT_MOD_INFINIBAND_SDR	(1 << 0)
++
++/* Vendor OUI - 165-167 */
++#define	SFF_8636_VENDOR_OUI_OFFSET		0xA5
++#define	SFF_8636_VENDOR_OUI_LEN		3
++
++/* Vendor OUI - 165-167 */
++#define	SFF_8636_VENDOR_PN_START_OFFSET		0xA8
++#define	SFF_8636_VENDOR_PN_END_OFFSET		0xB7
++
++/* Vendor Revision - 184-185 */
++#define	SFF_8636_VENDOR_REV_START_OFFSET	0xB8
++#define	SFF_8636_VENDOR_REV_END_OFFSET		0xB9
++
++/* Wavelength - 186-187 */
++#define	SFF_8636_WAVELEN_HIGH_BYTE_OFFSET	0xBA
++#define	SFF_8636_WAVELEN_LOW_BYTE_OFFSET	0xBB
++
++/* Wavelength  Tolerance- 188-189 */
++#define	SFF_8636_WAVE_TOL_HIGH_BYTE_OFFSET	0xBC
++#define	SFF_8636_WAVE_TOL_LOW_BYTE_OFFSET	0xBD
++
++/* Max case temp - Other than 70 C - 190 */
++#define	SFF_8636_MAXCASE_TEMP_OFFSET	0xBE
++
++/* CC_BASE - 191 */
++#define	SFF_8636_CC_BASE_OFFSET		0xBF
++
++/* Option Values - 192-195 */
++#define	SFF_8636_OPTION_1_OFFSET	0xC0
++#define	SFF_8636_ETHERNET_UNSPECIFIED		0x00
++#define	SFF_8636_ETHERNET_100G_AOC		0x01
++#define	SFF_8636_ETHERNET_100G_SR4		0x02
++#define	SFF_8636_ETHERNET_100G_LR4		0x03
++#define	SFF_8636_ETHERNET_100G_ER4		0x04
++#define	SFF_8636_ETHERNET_100G_SR10		0x05
++#define	SFF_8636_ETHERNET_100G_CWDM4_FEC	0x06
++#define	SFF_8636_ETHERNET_100G_PSM4		0x07
++#define	SFF_8636_ETHERNET_100G_ACC		0x08
++#define	SFF_8636_ETHERNET_100G_CWDM4_NO_FEC	0x09
++#define	SFF_8636_ETHERNET_100G_RSVD1		0x0A
++#define	SFF_8636_ETHERNET_100G_CR4		0x0B
++#define	SFF_8636_ETHERNET_25G_CR_CA_S		0x0C
++#define	SFF_8636_ETHERNET_25G_CR_CA_N		0x0D
++#define	SFF_8636_ETHERNET_40G_ER4		0x10
++#define	SFF_8636_ETHERNET_4X10_SR		0x11
++#define	SFF_8636_ETHERNET_40G_PSM4		0x12
++#define	SFF_8636_ETHERNET_G959_P1I1_2D1		0x13
++#define	SFF_8636_ETHERNET_G959_P1S1_2D2		0x14
++#define	SFF_8636_ETHERNET_G959_P1L1_2D2		0x15
++#define	SFF_8636_ETHERNET_10GT_SFI		0x16
++#define	SFF_8636_ETHERNET_100G_CLR4		0x17
++#define	SFF_8636_ETHERNET_100G_AOC2		0x18
++#define	SFF_8636_ETHERNET_100G_ACC2		0x19
++
++#define	SFF_8636_OPTION_2_OFFSET	0xC1
++/* Rx output amplitude */
++#define	SFF_8636_O2_RX_OUTPUT_AMP	(1 << 0)
++#define	SFF_8636_OPTION_3_OFFSET	0xC2
++/* Rx Squelch Disable */
++#define	SFF_8636_O3_RX_SQL_DSBL	(1 << 3)
++/* Rx Output Disable capable */
++#define	SFF_8636_O3_RX_OUTPUT_DSBL	(1 << 2)
++/* Tx Squelch Disable */
++#define	SFF_8636_O3_TX_SQL_DSBL	(1 << 1)
++/* Tx Squelch Impl */
++#define	SFF_8636_O3_TX_SQL_IMPL	(1 << 0)
++#define	SFF_8636_OPTION_4_OFFSET	0xC3
++/* Memory Page 02 present */
++#define	SFF_8636_O4_PAGE_02_PRESENT	(1 << 7)
++/* Memory Page 01 present */
++#define	SFF_8636_O4_PAGE_01_PRESENT	(1 << 6)
++/* Rate Select implemented */
++#define	SFF_8636_O4_RATE_SELECT	(1 << 5)
++/* Tx_DISABLE implemented */
++#define	SFF_8636_O4_TX_DISABLE		(1 << 4)
++/* Tx_FAULT implemented */
++#define	SFF_8636_O4_TX_FAULT		(1 << 3)
++/* Tx Squelch implemented */
++#define	SFF_8636_O4_TX_SQUELCH		(1 << 2)
++/* Tx Loss of Signal */
++#define	SFF_8636_O4_TX_LOS		(1 << 1)
++
++/* Vendor SN - 196-211 */
++#define	SFF_8636_VENDOR_SN_START_OFFSET	0xC4
++#define	SFF_8636_VENDOR_SN_END_OFFSET	0xD3
++
++/* Vendor Date - 212-219 */
++#define	SFF_8636_DATE_YEAR_OFFSET	0xD4
++#define	SFF_8636_DATE_YEAR_LEN			2
++#define	SFF_8636_DATE_MONTH_OFFSET	0xD6
++#define	SFF_8636_DATE_MONTH_LEN		2
++#define	SFF_8636_DATE_DAY_OFFSET	0xD8
++#define	SFF_8636_DATE_DAY_LEN			2
++#define	SFF_8636_DATE_VENDOR_LOT_OFFSET 0xDA
++#define	SFF_8636_DATE_VENDOR_LOT_LEN		2
++
++/* Diagnostic Monitoring Type - 220 */
++#define	SFF_8636_DIAG_TYPE_OFFSET	0xDC
++#define	SFF_8636_RX_PWR_TYPE_MASK	0x8
++#define	 SFF_8636_RX_PWR_TYPE_AVG_PWR	(1 << 3)
++#define	 SFF_8636_RX_PWR_TYPE_OMA	(0 << 3)
++#define	SFF_8636_TX_PWR_TYPE_MASK	0x4
++#define	 SFF_8636_TX_PWR_TYPE_AVG_PWR	(1 << 2)
++
++/* Enhanced Options - 221 */
++#define	SFF_8636_ENH_OPTIONS_OFFSET	0xDD
++#define	SFF_8636_RATE_SELECT_EXT_SUPPORT	(1 << 3)
++#define	SFF_8636_RATE_SELECT_APP_TABLE_SUPPORT	(1 << 2)
++
++/* Check code - 223 */
++#define	SFF_8636_CC_EXT_OFFSET		0xDF
++#define	SFF_8636_CC_EXT_LEN		1
++
++/*------------------------------------------------------------------------------
++ *
++ * Upper Memory Page 03h
++ * Contains module thresholds, channel thresholds and masks,
++ * and optional channel controls
++ *
++ * Offset - Page Num(3) * PageSize(0x80) + Page offset
++ */
++
++/* Module Thresholds (48 Bytes) 128-175 */
++/* MSB at low address, LSB at high address */
++#define	SFF_8636_TEMP_HALRM		0x200
++#define	SFF_8636_TEMP_LALRM		0x202
++#define	SFF_8636_TEMP_HWARN		0x204
++#define	SFF_8636_TEMP_LWARN		0x206
++
++#define	SFF_8636_VCC_HALRM		0x210
++#define	SFF_8636_VCC_LALRM		0x212
++#define	SFF_8636_VCC_HWARN		0x214
++#define	SFF_8636_VCC_LWARN		0x216
++
++#define	SFF_8636_RX_PWR_HALRM		0x230
++#define	SFF_8636_RX_PWR_LALRM		0x232
++#define	SFF_8636_RX_PWR_HWARN		0x234
++#define	SFF_8636_RX_PWR_LWARN		0x236
++
++#define	SFF_8636_TX_BIAS_HALRM		0x238
++#define	SFF_8636_TX_BIAS_LALRM		0x23A
++#define	SFF_8636_TX_BIAS_HWARN		0x23C
++#define	SFF_8636_TX_BIAS_LWARN		0x23E
++
++#define	SFF_8636_TX_PWR_HALRM		0x240
++#define	SFF_8636_TX_PWR_LALRM		0x242
++#define	SFF_8636_TX_PWR_HWARN		0x244
++#define	SFF_8636_TX_PWR_LWARN		0x246
++
++#define	ETH_MODULE_SFF_8636_MAX_LEN	640
++#define	ETH_MODULE_SFF_8436_MAX_LEN	640
++
++#endif /*SFF_8636_H__ */
+diff --git a/drivers/common/sff_module/sff_common.c b/drivers/common/sff_module/sff_common.c
+new file mode 100644
+index 0000000000..e5bc18650c
+--- /dev/null
++++ b/drivers/common/sff_module/sff_common.c
+@@ -0,0 +1,415 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2022 Intel Corporation
++ *
++ * Implements SFF-8024 Rev 4.0 of pluggable I/O configuration
++ *
++ * Common utilities for SFF-8436/8636 and SFF-8472/8079
++ *
++ */
++
++#include <stdio.h>
++#include <math.h>
++#include <rte_mbuf.h>
++#include <rte_ethdev.h>
++#include <rte_flow.h>
++#include "sff_common.h"
++#include "sff_telemetry.h"
++
++
++double convert_mw_to_dbm(double mw)
++{
++	return (10. * log10(mw / 1000.)) + 30.;
++}
++
++void sff_show_value_with_unit(const uint8_t *id, unsigned int reg,
++			      const char *name, unsigned int mult,
++			      const char *unit, sff_item *items)
++{
++	unsigned int val = id[reg];
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : %u%s\n", name, val * mult, unit);
++	sprintf(val_string, "%u%s", val * mult, unit);
++	add_item_string(items, name, val_string);
++}
++
++void sff_show_ascii(const uint8_t *id, unsigned int first_reg,
++		    unsigned int last_reg, const char *name, sff_item *items)
++{
++	unsigned int reg, val;
++	char tmp[3];
++	char val_string[TMP_STRING_SIZE];
++
++	memset(val_string, 0, sizeof(val_string));
++
++	printf("%-41s : ", name);
++	while (first_reg <= last_reg && id[last_reg] == ' ')
++		last_reg--;
++	for (reg = first_reg; reg <= last_reg; reg++) {
++		val = id[reg];
++		putchar(((val >= 32) && (val <= 126)) ? val : '_');
++		if ((val >= 32) && (val <= 126)) {
++			sprintf(tmp, "%c", val);
++			strcat(val_string, tmp);
++		} else {
++			strcat(val_string, "_");
++		}
++	}
++	printf("\n");
++	add_item_string(items, name, val_string);
++}
++
++void sff_8024_show_oui(const uint8_t *id, int id_offset, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : %02x:%02x:%02x\n", "Vendor OUI",
++		      id[id_offset], id[(id_offset) + 1],
++		      id[(id_offset) + 2]);
++	sprintf(val_string, "%02x:%02x:%02x",
++		id[id_offset], id[(id_offset) + 1], id[(id_offset) + 2]);
++	add_item_string(items, "Vendor OUI", val_string);
++}
++
++void sff_8024_show_identifier(const uint8_t *id, int id_offset, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x", "Identifier", id[id_offset]);
++	sprintf(val_string, "0x%02x", id[id_offset]);
++
++	switch (id[id_offset]) {
++	case SFF_8024_ID_UNKNOWN:
++		printf(" (no module present, unknown, or unspecified)\n");
++		strcat(val_string, " (no module present, unknown, or unspecified)");
++		break;
++	case SFF_8024_ID_GBIC:
++		printf(" (GBIC)\n");
++		strcat(val_string, " (GBIC)");
++		break;
++	case SFF_8024_ID_SOLDERED_MODULE:
++		printf(" (module soldered to motherboard)\n");
++		strcat(val_string, " (module soldered to motherboard)");
++		break;
++	case SFF_8024_ID_SFP:
++		printf(" (SFP)\n");
++		strcat(val_string, " (SFP)");
++		break;
++	case SFF_8024_ID_300_PIN_XBI:
++		printf(" (300 pin XBI)\n");
++		strcat(val_string, " (300 pin XBI)");
++		break;
++	case SFF_8024_ID_XENPAK:
++		printf(" (XENPAK)\n");
++		strcat(val_string, " (XENPAK)");
++		break;
++	case SFF_8024_ID_XFP:
++		printf(" (XFP)\n");
++		strcat(val_string, " (XFP)");
++		break;
++	case SFF_8024_ID_XFF:
++		printf(" (XFF)\n");
++		strcat(val_string, " (XFF)");
++		break;
++	case SFF_8024_ID_XFP_E:
++		printf(" (XFP-E)\n");
++		strcat(val_string, " (XFP-E)");
++		break;
++	case SFF_8024_ID_XPAK:
++		printf(" (XPAK)\n");
++		strcat(val_string, " (XPAK)");
++		break;
++	case SFF_8024_ID_X2:
++		printf(" (X2)\n");
++		strcat(val_string, " (X2)");
++		break;
++	case SFF_8024_ID_DWDM_SFP:
++		printf(" (DWDM-SFP)\n");
++		strcat(val_string, " (DWDM-SFP)");
++		break;
++	case SFF_8024_ID_QSFP:
++		printf(" (QSFP)\n");
++		strcat(val_string, " (QSFP)");
++		break;
++	case SFF_8024_ID_QSFP_PLUS:
++		printf(" (QSFP+)\n");
++		strcat(val_string, " (QSFP+)");
++		break;
++	case SFF_8024_ID_CXP:
++		printf(" (CXP)\n");
++		strcat(val_string, " (CXP)");
++		break;
++	case SFF_8024_ID_HD4X:
++		printf(" (Shielded Mini Multilane HD 4X)\n");
++		strcat(val_string, " (Shielded Mini Multilane HD 4X)");
++		break;
++	case SFF_8024_ID_HD8X:
++		printf(" (Shielded Mini Multilane HD 8X)\n");
++		strcat(val_string, " (Shielded Mini Multilane HD 8X)");
++		break;
++	case SFF_8024_ID_QSFP28:
++		printf(" (QSFP28)\n");
++		strcat(val_string, " (QSFP28)");
++		break;
++	case SFF_8024_ID_CXP2:
++		printf(" (CXP2/CXP28)\n");
++		strcat(val_string, " (CXP2/CXP28)");
++		break;
++	case SFF_8024_ID_CDFP:
++		printf(" (CDFP Style 1/Style 2)\n");
++		strcat(val_string, " (CDFP Style 1/Style 2)");
++		break;
++	case SFF_8024_ID_HD4X_FANOUT:
++		printf(" (Shielded Mini Multilane HD 4X Fanout Cable)\n");
++		strcat(val_string, " (Shielded Mini Multilane HD 4X Fanout Cable)");
++		break;
++	case SFF_8024_ID_HD8X_FANOUT:
++		printf(" (Shielded Mini Multilane HD 8X Fanout Cable)\n");
++		strcat(val_string, " (Shielded Mini Multilane HD 8X Fanout Cable)");
++		break;
++	case SFF_8024_ID_CDFP_S3:
++		printf(" (CDFP Style 3)\n");
++		strcat(val_string, " (CDFP Style 3)");
++		break;
++	case SFF_8024_ID_MICRO_QSFP:
++		printf(" (microQSFP)\n");
++		strcat(val_string, " (microQSFP)");
++		break;
++	default:
++		printf(" (reserved or unknown)\n");
++		strcat(val_string, " (reserved or unknown)");
++		break;
++	}
++	add_item_string(items, "Identifier", val_string);
++}
++
++void sff_8024_show_connector(const uint8_t *id, int ctor_offset, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x", "Connector", id[ctor_offset]);
++	sprintf(val_string, "0x%02x", id[ctor_offset]);
++
++	switch (id[ctor_offset]) {
++	case  SFF_8024_CTOR_UNKNOWN:
++		printf(" (unknown or unspecified)\n");
++		strcat(val_string, " (unknown or unspecified)");
++		break;
++	case SFF_8024_CTOR_SC:
++		printf(" (SC)\n");
++		strcat(val_string, " (SC)");
++		break;
++	case SFF_8024_CTOR_FC_STYLE_1:
++		printf(" (Fibre Channel Style 1 copper)\n");
++		strcat(val_string, " (Fibre Channel Style 1 copper)");
++		break;
++	case SFF_8024_CTOR_FC_STYLE_2:
++		printf(" (Fibre Channel Style 2 copper)\n");
++		strcat(val_string, " (Fibre Channel Style 2 copper)");
++		break;
++	case SFF_8024_CTOR_BNC_TNC:
++		printf(" (BNC/TNC)\n");
++		strcat(val_string, " (BNC/TNC)");
++		break;
++	case SFF_8024_CTOR_FC_COAX:
++		printf(" (Fibre Channel coaxial headers)\n");
++		strcat(val_string, " (Fibre Channel coaxial headers)");
++		break;
++	case SFF_8024_CTOR_FIBER_JACK:
++		printf(" (FibreJack)\n");
++		strcat(val_string, " (FibreJack)");
++		break;
++	case SFF_8024_CTOR_LC:
++		printf(" (LC)\n");
++		strcat(val_string, " (LC)");
++		break;
++	case SFF_8024_CTOR_MT_RJ:
++		printf(" (MT-RJ)\n");
++		strcat(val_string, " (MT-RJ)");
++		break;
++	case SFF_8024_CTOR_MU:
++		printf(" (MU)\n");
++		strcat(val_string, " (MU)");
++		break;
++	case SFF_8024_CTOR_SG:
++		printf(" (SG)\n");
++		strcat(val_string, " (SG)");
++		break;
++	case SFF_8024_CTOR_OPT_PT:
++		printf(" (Optical pigtail)\n");
++		strcat(val_string, " (Optical pigtail)");
++		break;
++	case SFF_8024_CTOR_MPO:
++		printf(" (MPO Parallel Optic)\n");
++		strcat(val_string, " (MPO Parallel Optic)");
++		break;
++	case SFF_8024_CTOR_MPO_2:
++		printf(" (MPO Parallel Optic - 2x16)\n");
++		strcat(val_string, " (MPO Parallel Optic - 2x16)");
++		break;
++	case SFF_8024_CTOR_HSDC_II:
++		printf(" (HSSDC II)\n");
++		strcat(val_string, " (HSSDC II)");
++		break;
++	case SFF_8024_CTOR_COPPER_PT:
++		printf(" (Copper pigtail)\n");
++		strcat(val_string, " (Copper pigtail)");
++		break;
++	case SFF_8024_CTOR_RJ45:
++		printf(" (RJ45)\n");
++		strcat(val_string, " (RJ45)");
++		break;
++	case SFF_8024_CTOR_NO_SEPARABLE:
++		printf(" (No separable connector)\n");
++		strcat(val_string, " (No separable connector)");
++		break;
++	case SFF_8024_CTOR_MXC_2x16:
++		printf(" (MXC 2x16)\n");
++		strcat(val_string, " (MXC 2x16)");
++		break;
++	default:
++		printf(" (reserved or unknown)\n");
++		strcat(val_string, " (reserved or unknown)");
++		break;
++	}
++	add_item_string(items, "Connector", val_string);
++}
++
++void sff_8024_show_encoding(const uint8_t *id, int encoding_offset,
++			    int sff_type, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	printf("%-41s : 0x%02x", "Encoding", id[encoding_offset]);
++	sprintf(val_string, "0x%02x", id[encoding_offset]);
++
++	switch (id[encoding_offset]) {
++	case SFF_8024_ENCODING_UNSPEC:
++		printf(" (unspecified)\n");
++		strcat(val_string, " (unspecified)");
++		break;
++	case SFF_8024_ENCODING_8B10B:
++		printf(" (8B/10B)\n");
++		strcat(val_string, " (8B/10B)");
++		break;
++	case SFF_8024_ENCODING_4B5B:
++		printf(" (4B/5B)\n");
++		strcat(val_string, " (4B/5B)");
++		break;
++	case SFF_8024_ENCODING_NRZ:
++		printf(" (NRZ)\n");
++		strcat(val_string, " (NRZ)");
++		break;
++	case SFF_8024_ENCODING_4h:
++		if (sff_type == RTE_ETH_MODULE_SFF_8472) {
++			printf(" (Manchester)\n");
++			strcat(val_string, " (Manchester)");
++		} else if (sff_type == RTE_ETH_MODULE_SFF_8636) {
++			printf(" (SONET Scrambled)\n");
++			strcat(val_string, " (SONET Scrambled)");
++		}
++		break;
++	case SFF_8024_ENCODING_5h:
++		if (sff_type == RTE_ETH_MODULE_SFF_8472) {
++			printf(" (SONET Scrambled)\n");
++			strcat(val_string, " (SONET Scrambled)");
++		} else if (sff_type == RTE_ETH_MODULE_SFF_8636) {
++			printf(" (64B/66B)\n");
++			strcat(val_string, " (64B/66B)");
++		}
++		break;
++	case SFF_8024_ENCODING_6h:
++		if (sff_type == RTE_ETH_MODULE_SFF_8472) {
++			printf(" (64B/66B)\n");
++			strcat(val_string, " (64B/66B)");
++		} else if (sff_type == RTE_ETH_MODULE_SFF_8636) {
++			printf(" (Manchester)\n");
++			strcat(val_string, " (Manchester)");
++		}
++		break;
++	case SFF_8024_ENCODING_256B:
++		printf(" ((256B/257B (transcoded FEC-enabled data))\n");
++		strcat(val_string,
++		       " ((256B/257B (transcoded FEC-enabled data))");
++		break;
++	case SFF_8024_ENCODING_PAM4:
++		printf(" (PAM4)\n");
++		strcat(val_string, " (PAM4)");
++		break;
++	default:
++		printf(" (reserved or unknown)\n");
++		strcat(val_string, " (reserved or unknown)");
++		break;
++	}
++	add_item_string(items, "Encoding", val_string);
++}
++
++void sff_show_thresholds(struct sff_diags sd, sff_item *items)
++{
++	char val_string[TMP_STRING_SIZE];
++
++	PRINT_BIAS("Laser bias current high alarm threshold", sd.bias_cur[HALRM]);
++	SPRINT_BIAS(val_string, sd.bias_cur[HALRM]);
++	add_item_string(items, "Laser bias current high alarm threshold", val_string);
++	PRINT_BIAS("Laser bias current low alarm threshold", sd.bias_cur[LALRM]);
++	SPRINT_BIAS(val_string, sd.bias_cur[LALRM]);
++	add_item_string(items, "Laser bias current low alarm threshold", val_string);
++	PRINT_BIAS("Laser bias current high warning threshold", sd.bias_cur[HWARN]);
++	SPRINT_BIAS(val_string, sd.bias_cur[HWARN]);
++	add_item_string(items, "Laser bias current high warning threshold", val_string);
++	PRINT_BIAS("Laser bias current low warning threshold", sd.bias_cur[LWARN]);
++	SPRINT_BIAS(val_string, sd.bias_cur[LWARN]);
++	add_item_string(items, "Laser bias current low warning threshold", val_string);
++
++	PRINT_xX_PWR("Laser output power high alarm threshold", sd.tx_power[HALRM]);
++	SPRINT_xX_PWR(val_string, sd.tx_power[HALRM]);
++	add_item_string(items, "Laser output power high alarm threshold", val_string);
++	PRINT_xX_PWR("Laser output power low alarm threshold", sd.tx_power[LALRM]);
++	SPRINT_xX_PWR(val_string, sd.tx_power[LALRM]);
++	add_item_string(items, "Laser output power low alarm threshold", val_string);
++	PRINT_xX_PWR("Laser output power high warning threshold", sd.tx_power[HWARN]);
++	SPRINT_xX_PWR(val_string, sd.tx_power[HWARN]);
++	add_item_string(items, "Laser output power high warning threshold", val_string);
++	PRINT_xX_PWR("Laser output power low warning threshold", sd.tx_power[LWARN]);
++	SPRINT_xX_PWR(val_string, sd.tx_power[LWARN]);
++	add_item_string(items, "Laser output power low warning threshold", val_string);
++
++	PRINT_TEMP("Module temperature high alarm threshold", sd.sfp_temp[HALRM]);
++	SPRINT_TEMP(val_string, sd.sfp_temp[HALRM]);
++	add_item_string(items, "Module temperature high alarm threshold", val_string);
++	PRINT_TEMP("Module temperature low alarm threshold", sd.sfp_temp[LALRM]);
++	SPRINT_TEMP(val_string, sd.sfp_temp[LALRM]);
++	add_item_string(items, "Module temperature low alarm threshold", val_string);
++	PRINT_TEMP("Module temperature high warning threshold", sd.sfp_temp[HWARN]);
++	SPRINT_TEMP(val_string, sd.sfp_temp[HWARN]);
++	add_item_string(items, "Module temperature high warning threshold", val_string);
++	PRINT_TEMP("Module temperature low warning threshold", sd.sfp_temp[LWARN]);
++	SPRINT_TEMP(val_string, sd.sfp_temp[LWARN]);
++	add_item_string(items, "Module temperature low warning threshold", val_string);
++
++	PRINT_VCC("Module voltage high alarm threshold", sd.sfp_voltage[HALRM]);
++	SPRINT_VCC(val_string, sd.sfp_voltage[HALRM]);
++	add_item_string(items, "Module voltage high alarm threshold", val_string);
++	PRINT_VCC("Module voltage low alarm threshold", sd.sfp_voltage[LALRM]);
++	SPRINT_VCC(val_string, sd.sfp_voltage[LALRM]);
++	add_item_string(items, "Module voltage low alarm threshold", val_string);
++	PRINT_VCC("Module voltage high warning threshold", sd.sfp_voltage[HWARN]);
++	SPRINT_VCC(val_string, sd.sfp_voltage[HWARN]);
++	add_item_string(items, "Module voltage high warning threshold", val_string);
++	PRINT_VCC("Module voltage low warning threshold", sd.sfp_voltage[LWARN]);
++	SPRINT_VCC(val_string, sd.sfp_voltage[LWARN]);
++	add_item_string(items, "Module voltage low alarm threshold", val_string);
++
++	PRINT_xX_PWR("Laser rx power high alarm threshold", sd.rx_power[HALRM]);
++	SPRINT_xX_PWR(val_string, sd.rx_power[HALRM]);
++	add_item_string(items, "Laser rx power high alarm threshold", val_string);
++	PRINT_xX_PWR("Laser rx power low alarm threshold", sd.rx_power[LALRM]);
++	SPRINT_xX_PWR(val_string, sd.rx_power[LALRM]);
++	add_item_string(items, "Laser rx power low alarm threshold", val_string);
++	PRINT_xX_PWR("Laser rx power high warning threshold", sd.rx_power[HWARN]);
++	SPRINT_xX_PWR(val_string, sd.rx_power[HWARN]);
++	add_item_string(items, "Laser rx power high warning threshold", val_string);
++	PRINT_xX_PWR("Laser rx power low warning threshold", sd.rx_power[LWARN]);
++	SPRINT_xX_PWR(val_string, sd.rx_power[LWARN]);
++	add_item_string(items, "Laser rx power low warning threshold", val_string);
++}
+diff --git a/drivers/common/sff_module/sff_common.h b/drivers/common/sff_module/sff_common.h
+new file mode 100644
+index 0000000000..04b6a54a87
+--- /dev/null
++++ b/drivers/common/sff_module/sff_common.h
+@@ -0,0 +1,192 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2022 Intel Corporation
++ *
++ * Implements SFF-8024 Rev 4.0 of pluggable I/O configuration
++ *
++ * Common utilities for SFF-8436/8636 and SFF-8472/8079
++ *
++ */
++
++#ifndef SFF_COMMON_H__
++#define SFF_COMMON_H__
++
++#include <stdio.h>
++#include <rte_mbuf.h>
++#include <rte_ethdev.h>
++#include <rte_flow.h>
++#include <sff_telemetry.h>
++
++#define SFF_8024_ID_OFFSET			0x00
++#define SFF_8024_ID_UNKNOWN			0x00
++#define SFF_8024_ID_GBIC			0x01
++#define SFF_8024_ID_SOLDERED_MODULE		0x02
++#define SFF_8024_ID_SFP				0x03
++#define SFF_8024_ID_300_PIN_XBI			0x04
++#define SFF_8024_ID_XENPAK			0x05
++#define SFF_8024_ID_XFP				0x06
++#define SFF_8024_ID_XFF				0x07
++#define SFF_8024_ID_XFP_E			0x08
++#define SFF_8024_ID_XPAK			0x09
++#define SFF_8024_ID_X2				0x0A
++#define SFF_8024_ID_DWDM_SFP			0x0B
++#define SFF_8024_ID_QSFP			0x0C
++#define SFF_8024_ID_QSFP_PLUS			0x0D
++#define SFF_8024_ID_CXP				0x0E
++#define SFF_8024_ID_HD4X			0x0F
++#define SFF_8024_ID_HD8X			0x10
++#define SFF_8024_ID_QSFP28			0x11
++#define SFF_8024_ID_CXP2			0x12
++#define SFF_8024_ID_CDFP			0x13
++#define SFF_8024_ID_HD4X_FANOUT			0x14
++#define SFF_8024_ID_HD8X_FANOUT			0x15
++#define SFF_8024_ID_CDFP_S3			0x16
++#define SFF_8024_ID_MICRO_QSFP			0x17
++#define SFF_8024_ID_LAST			SFF_8024_ID_MICRO_QSFP
++#define SFF_8024_ID_UNALLOCATED_LAST		0x7F
++#define SFF_8024_ID_VENDOR_START		0x80
++#define SFF_8024_ID_VENDOR_LAST			0xFF
++
++#define SFF_8024_CTOR_UNKNOWN			0x00
++#define SFF_8024_CTOR_SC			0x01
++#define SFF_8024_CTOR_FC_STYLE_1		0x02
++#define SFF_8024_CTOR_FC_STYLE_2		0x03
++#define SFF_8024_CTOR_BNC_TNC			0x04
++#define SFF_8024_CTOR_FC_COAX			0x05
++#define SFF_8024_CTOR_FIBER_JACK		0x06
++#define SFF_8024_CTOR_LC			0x07
++#define SFF_8024_CTOR_MT_RJ			0x08
++#define SFF_8024_CTOR_MU			0x09
++#define SFF_8024_CTOR_SG			0x0A
++#define SFF_8024_CTOR_OPT_PT			0x0B
++#define SFF_8024_CTOR_MPO			0x0C
++#define SFF_8024_CTOR_MPO_2			0x0D
++/* 0E-1Fh --- Reserved */
++#define SFF_8024_CTOR_HSDC_II			0x20
++#define SFF_8024_CTOR_COPPER_PT			0x21
++#define SFF_8024_CTOR_RJ45			0x22
++#define SFF_8024_CTOR_NO_SEPARABLE		0x23
++#define SFF_8024_CTOR_MXC_2x16			0x24
++#define SFF_8024_CTOR_LAST			SFF_8024_CTOR_MXC_2x16
++#define SFF_8024_CTOR_UNALLOCATED_LAST		0x7F
++#define SFF_8024_CTOR_VENDOR_START		0x80
++#define SFF_8024_CTOR_VENDOR_LAST		0xFF
++
++/* ENCODING Values */
++#define SFF_8024_ENCODING_UNSPEC		0x00
++#define SFF_8024_ENCODING_8B10B			0x01
++#define SFF_8024_ENCODING_4B5B			0x02
++#define SFF_8024_ENCODING_NRZ			0x03
++/*
++ * Value: 04h
++ * SFF-8472      - Manchester
++ * SFF-8436/8636 - SONET Scrambled
++ */
++#define SFF_8024_ENCODING_4h			0x04
++/*
++ * Value: 05h
++ * SFF-8472      - SONET Scrambled
++ * SFF-8436/8636 - 64B/66B
++ */
++#define SFF_8024_ENCODING_5h			0x05
++/*
++ * Value: 06h
++ * SFF-8472      - 64B/66B
++ * SFF-8436/8636 - Manchester
++ */
++#define  SFF_8024_ENCODING_6h			0x06
++#define  SFF_8024_ENCODING_256B			0x07
++#define  SFF_8024_ENCODING_PAM4			0x08
++
++/* Most common case: 16-bit unsigned integer in a certain unit */
++#define OFFSET_TO_U16(offset) \
++		(id[offset] << 8 | id[(offset) + 1])
++
++#define PRINT_xX_PWR(string, var) \
++		printf("%-41s : %.4f mW / %.2f dBm\n", (string), \
++		       (double)((var) / 10000.), \
++		       convert_mw_to_dbm((double)((var) / 10000.)))
++#define SPRINT_xX_PWR(str, var) \
++		sprintf(str, "%.4f mW / %.2f dBm", \
++			(double)((var) / 10000.), \
++			convert_mw_to_dbm((double)((var) / 10000.)))
++
++#define PRINT_BIAS(string, bias_cur) \
++		printf("%-41s : %.3f mA\n", (string), \
++		       (double)(bias_cur / 500.))
++#define SPRINT_BIAS(str, bias_cur) \
++		sprintf(str, "%.3f mA", (double)(bias_cur / 500.))
++
++#define PRINT_TEMP(string, temp) \
++		printf("%-41s : %.2f degrees C / %.2f degrees F\n", \
++		       (string), (double)(temp / 256.), \
++		       (double)(temp / 256. * 1.8 + 32.))
++#define SPRINT_TEMP(str, temp) \
++		sprintf(str, "%.2f degrees C / %.2f degrees F", \
++			(double)(temp / 256.), \
++			(double)(temp / 256. * 1.8 + 32.))
++
++#define PRINT_VCC(string, sfp_voltage) \
++		printf("%-41s : %.4f V\n", (string), \
++		       (double)(sfp_voltage / 10000.))
++#define SPRINT_VCC(str, sfp_voltage) \
++		sprintf(str, "%.4f V", (double)(sfp_voltage / 10000.))
++
++#define PRINT_xX_THRESH_PWR(string, var, index) \
++		PRINT_xX_PWR(string, (var)[(index)])
++
++/* Channel Monitoring Fields */
++struct sff_channel_diags {
++	uint16_t bias_cur;      /* Measured bias current in 2uA units */
++	uint16_t rx_power;      /* Measured RX Power */
++	uint16_t tx_power;      /* Measured TX Power */
++};
++
++/* Module Monitoring Fields */
++struct sff_diags {
++
++#define MAX_CHANNEL_NUM 4
++#define LWARN 0
++#define HWARN 1
++#define LALRM 2
++#define HALRM 3
++#define MCURR 4
++
++	/* Supports DOM */
++	uint8_t supports_dom;
++	/* Supports alarm/warning thold */
++	uint8_t supports_alarms;
++	/* RX Power: 0 = OMA, 1 = Average power */
++	uint8_t  rx_power_type;
++	/* TX Power: 0 = Not supported, 1 = Average power */
++	uint8_t  tx_power_type;
++
++	uint8_t calibrated_ext;    /* Is externally calibrated */
++	/* [5] tables are low/high warn, low/high alarm, current */
++	/* SFP voltage in 0.1mV units */
++	uint16_t sfp_voltage[5];
++	/* SFP Temp in 16-bit signed 1/256 Celcius */
++	int16_t sfp_temp[5];
++	/* Measured bias current in 2uA units */
++	uint16_t bias_cur[5];
++	/* Measured TX Power */
++	uint16_t tx_power[5];
++	/* Measured RX Power */
++	uint16_t rx_power[5];
++	struct sff_channel_diags scd[MAX_CHANNEL_NUM];
++};
++
++double convert_mw_to_dbm(double mw);
++void sff_show_value_with_unit(const uint8_t *id, unsigned int reg,
++			      const char *name, unsigned int mult,
++			      const char *unit, sff_item *items);
++void sff_show_ascii(const uint8_t *id, unsigned int first_reg,
++		    unsigned int last_reg, const char *name, sff_item *items);
++void sff_show_thresholds(struct sff_diags sd, sff_item *items);
++
++void sff_8024_show_oui(const uint8_t *id, int id_offset, sff_item *items);
++void sff_8024_show_identifier(const uint8_t *id, int id_offset, sff_item *items);
++void sff_8024_show_connector(const uint8_t *id, int ctor_offset, sff_item *items);
++void sff_8024_show_encoding(const uint8_t *id, int encoding_offset,
++			    int sff_type, sff_item *items);
++
++#endif /* SFF_COMMON_H__ */
+diff --git a/drivers/common/sff_module/sff_telemetry.c b/drivers/common/sff_module/sff_telemetry.c
+new file mode 100644
+index 0000000000..dd838b6012
+--- /dev/null
++++ b/drivers/common/sff_module/sff_telemetry.c
+@@ -0,0 +1,142 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2018 Cavium, Inc
++ */
++
++#include <rte_ethdev.h>
++#include <rte_common.h>
++#include "sff_telemetry.h"
++
++static void
++sff_port_module_eeprom_display(uint16_t port_id, sff_item *items)
++{
++	struct rte_eth_dev_module_info minfo;
++	struct rte_dev_eeprom_info einfo;
++	int ret;
++
++	ret = rte_eth_dev_get_module_info(port_id, &minfo);
++	if (ret != 0) {
++		switch (ret) {
++		case -ENODEV:
++			fprintf(stderr, "port index %d invalid\n", port_id);
++			break;
++		case -ENOTSUP:
++			fprintf(stderr, "operation not supported by device\n");
++			break;
++		case -EIO:
++			fprintf(stderr, "device is removed\n");
++			break;
++		default:
++			fprintf(stderr, "Unable to get module EEPROM: %d\n",
++				ret);
++			break;
++		}
++		return;
++	}
++
++	einfo.offset = 0;
++	einfo.length = minfo.eeprom_len;
++	einfo.data = calloc(1, minfo.eeprom_len);
++	if (!einfo.data) {
++		fprintf(stderr,
++			"Allocation of port %u eeprom data failed\n",
++			port_id);
++		return;
++	}
++
++	ret = rte_eth_dev_get_module_eeprom(port_id, &einfo);
++	if (ret != 0) {
++		switch (ret) {
++		case -ENODEV:
++			fprintf(stderr, "port index %d invalid\n", port_id);
++			break;
++		case -ENOTSUP:
++			fprintf(stderr, "operation not supported by device\n");
++			break;
++		case -EIO:
++			fprintf(stderr, "device is removed\n");
++			break;
++		default:
++			fprintf(stderr, "Unable to get module EEPROM: %d\n",
++				ret);
++			break;
++		}
++		free(einfo.data);
++		return;
++	}
++
++	switch (minfo.type) {
++	case RTE_ETH_MODULE_SFF_8079:
++		sff_8079_show_all(einfo.data, items);
++		break;
++	case RTE_ETH_MODULE_SFF_8472:
++		sff_8079_show_all(einfo.data, items);
++		sff_8472_show_all(einfo.data, items);
++		break;
++	case RTE_ETH_MODULE_SFF_8436:
++	case RTE_ETH_MODULE_SFF_8636:
++		sff_8636_show_all(einfo.data, einfo.length, items);
++		break;
++	default:
++		break;
++	}
++	printf("Finish -- Port: %d MODULE EEPROM length: %d bytes\n", port_id, einfo.length);
++	free(einfo.data);
++}
++
++void
++add_item_string(sff_item *items, const char *name_str, const char *value_str)
++{
++	/* append different values for same keys */
++	if (sff_item_count > 0 &&
++	    (strcmp(items[sff_item_count - 1].name, name_str) == 0)) {
++		strcat(items[sff_item_count - 1].value, "; ");
++		strcat(items[sff_item_count - 1].value, value_str);
++		return;
++	}
++
++	sprintf(items[sff_item_count].name, "%s", name_str);
++	sprintf(items[sff_item_count].value, "%s", value_str);
++	sff_item_count++;
++}
++
++static int
++sff_module_tel_handle_info(const char *cmd __rte_unused, const char *params,
++			struct rte_tel_data *d)
++{
++	/* handle module info */
++	char *end_param;
++	int port_id, i;
++	sff_item *items;
++	sff_item_count = 0;
++
++	if (params == NULL || strlen(params) == 0 || !isdigit(*params))
++		return -1;
++
++	port_id = strtoul(params, &end_param, 0);
++	if (*end_param != '\0')
++		RTE_ETHDEV_LOG(NOTICE,
++			"Extra parameters passed to ethdev telemetry command, ignoring");
++
++	items = (sff_item *)malloc(SFF_ITEM_SIZE * SFF_ITEM_MAX_COUNT);
++	if (items == NULL) {
++		printf("Error allocating memory of items\n");
++		free(items);
++		return -1;
++	}
++
++	sff_port_module_eeprom_display(port_id, items);
++
++	rte_tel_data_start_dict(d);
++	for (i = 0; i < sff_item_count; i++)
++		rte_tel_data_add_dict_string(d, items[i].name, items[i].value);
++
++	free(items);
++	return 0;
++}
++
++RTE_INIT(sff_module_info_init_telemetry)
++{
++	rte_telemetry_register_cmd(
++		"/sff_module/info", sff_module_tel_handle_info,
++		"Returns eeprom module info. Parameters: port_id");
++}
+diff --git a/drivers/common/sff_module/sff_telemetry.h b/drivers/common/sff_module/sff_telemetry.h
+new file mode 100644
+index 0000000000..917197fb46
+--- /dev/null
++++ b/drivers/common/sff_module/sff_telemetry.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2018 Cavium, Inc
++ */
++
++#ifndef SFF_TELEMETRY_H_
++#define SFF_TELEMETRY_H_
++
++#include <rte_ethdev.h>
++#include <rte_telemetry.h>
++
++#define ARRAY_SIZE(arr) RTE_DIM(arr)
++
++#define SFF_ITEM_NAME_SIZE 64
++#define SFF_ITEM_VALUE_SIZE 256
++#define SFF_ITEM_MAX_COUNT 256
++#define TMP_STRING_SIZE 64
++
++typedef struct sff_module_info_item {
++        char name[SFF_ITEM_NAME_SIZE];    /* The item name. */
++        char value[SFF_ITEM_VALUE_SIZE];  /* The item value. */
++} sff_item;
++
++#define SFF_ITEM_SIZE sizeof(sff_item)
++
++uint16_t sff_item_count;
++
++/* SFF-8079 Optics diagnostics */
++__rte_internal
++extern void sff_8079_show_all(const uint8_t *id, sff_item *items);
++
++/* SFF-8472 Optics diagnostics */
++__rte_internal
++extern void sff_8472_show_all(const uint8_t *id, sff_item *items);
++
++/* SFF-8636 Optics diagnostics */
++__rte_internal
++extern void sff_8636_show_all(const uint8_t *id, uint32_t eeprom_len, sff_item *items);
++
++void add_item_string(sff_item *items, const char *name_str, const char *value_str);
++
++#endif /* SFF_TELEMETRY_H_ */
+diff --git a/drivers/common/sff_module/version.map b/drivers/common/sff_module/version.map
+new file mode 100644
+index 0000000000..769b7af777
+--- /dev/null
++++ b/drivers/common/sff_module/version.map
+@@ -0,0 +1,9 @@
++INTERNAL {
++	global:
++
++	sff_8079_show_all;
++	sff_8472_show_all;
++	sff_8636_show_all;
++
++	local: *;
++};
+\ No newline at end of file
