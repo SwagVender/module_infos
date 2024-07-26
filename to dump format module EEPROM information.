@@ -1,5 +1,9 @@
-This patch introduce a new telemetry command '/sff_module/info'
-to dump format module EEPROM information.
+This patch introduces a new telemetry command '/sff_module/info' to dump format module EEPROM information.
+
+The format support for SFP(Small Form-factor Pluggable)/SFP+
+/QSFP+(Quad Small Form-factor Pluggable)/QSFP28 modules based on
+SFF(Small Form Factor) Committee specifications
+SFF-8079/SFF-8472/SFF-8024/SFF-8636.
 
   In telemetry client run command:
   --> /sff_module/info,<port number>
