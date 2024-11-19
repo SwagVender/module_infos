@@ -1,0 +1,100 @@
+switch#sh idprom interface GigabitEthernet0/25 
+----------------------------------------------- General SFP Information ----------------------------------------------- 
+Identifier : 0x03 
+Connector : 0x00 
+Transceiver : 0x00 0x00 0x00 0x08 0x00 0x00 0x00 0x00 
+Encoding : 0x01 
+BR_Nominal : 0x0D 
+Vendor Name : CISCO-AGILENT 
+Vendor Part Number : QBCU-5798R 
+Vendor Revision : 0x20 0x20 0x20 0x20 
+Vendor Serial Number : AGS1028L5W6 
+----------------------------------------------- Other Information ------------------------------------------------------- 
+Port asic num : 04 
+Port asic port num : 00 
+SFP presence index : 00 
+SFP iter cnt : 31178 
+SFP failed oper flag : 0x00000000 
+IIC error cnt : 0 
+IIC error dsb cnt : 0 
+IIC max sts cnt : 50 
+Chk for link status : 01 
+Link status : 00 
+Autoneg enable : 00 
+Flow control Pause : 00 
+Flow control asymPause: 00 
+Duplex mode : 00 
+PcsInfo : 0x01DAC348 
+MacInfo : 0x01DAC338 0x01DAC330 
+AutoNeg : 0x01DAC330 0x01DAC338 
+----------------------------------------------- Sfp selection ASIC reg map -------------------------------- 
+stbi : 0x00 
+sfpControl : 0x4E 
+Regs Loc : 0xF0000000 
+-------------------------------- SFF-8472 MSA EEPROM Data =========================================== 
+000 : 03 04 00 00 00 00 08 00 00 00 
+010 : 00 01 0D 00 00 00 00 00 64 00 
+020 : 43 49 53 43 4F 2D 41 47 49 4C 
+030 : 45 4E 54 20 20 20 01 00 30 D3 
+040 : 51 42 43 55 2D 35 37 39 38 52 
+050 : 20 20 20 20 20 20 20 20 20 20 
+060 : 41 0C C1 5C 00 10 00 00 41 47 
+070 : 53 31 30 32 38 4C 35 57 36 20 
+080 : 20 20 20 20 30 36 30 37 31 34 
+090 : 20 20 00 00 00 D6 00 00 06 C6 
+100 : EE 3A FB 5A 10 A8 6E 84 B2 14 
+110 : 0F C6 8A 11 0F 00 00 00 00 00 
+120 : 00 00 00 00 EA CE 54 F8 
+----------------------------------------------- YETI INTERNAL REGS ----------------------------------------------- 
+Location=0xD8000500 : Value=0x00 
+Location=0xD8000501 : Value=0x00 
+Location=0xD8000502 : Value=0x00 
+Location=0xD8000503 : Value=0x00 
+Location=0xD8000504 : Value=0x00 
+Location=0xD8000505 : Value=0x00 
+Location=0xD8000506 : Value=0x00 
+Location=0xD8000507 : Value=0x02 
+Location=0xD8000508 : Value=0x00 
+Location=0xD8000509 : Value=0x40 
+Location=0xD800050A : Value=0x00 
+Location=0xD800050B : Value=0x00 
+Location=0xD800050C : Value=0x05 
+Location=0xD800050D : Value=0x00 
+Location=0xD800050E : Value=0x01 
+Location=0xD800050F : Value=0x00 
+Location=0xD8000510 : Value=0x0F 
+yetiIICinited : Value=0x00000001 
+yetiIICLockPassCnt : Value=0 
+yetiIICLockFailCnt : Value=0 
+yetiIICLockApp : Value=11 
+----------------------------------------------- 0000: 1140 
+Control Register : 0001 0001 0100 0000 0001: 7949 
+Control STATUS : 0111 1001 0100 1001 0002: 0141 
+Phy ID 1 : 0000 0001 0100 0001 0003: 0CC1 
+Phy ID 2 : 0000 1100 1100 0001 0004: 01E1 
+Auto-Negotiation Advertisement : 0000 0001 1110 0001 0005: 0000 
+Auto-Negotiation Link Partner : 0000 0000 0000 0000 0006: 0004 
+Auto-Negotiation Expansion Reg : 0000 0000 0000 0100 0007: 2001 
+Next Page Transmit Register : 0010 0000 0000 0001 0008: 0000 
+Link Partner Next page Registe : 0000 0000 0000 0000 0009: 0E00 
+1000BASE-T Control Register : 0000 1110 0000 0000 000A: 4000 
+1000BASE-T Status Register : 0100 0000 0000 0000 000F: F000 
+Extended Status Register : 1111 0000 0000 0000 0010: 0078 
+PHY Specific Control Register : 0000 0000 0111 1000 0011: 8140 
+PHY Specific Status Register : 1000 0001 0100 0000 0012: 0000 
+Interrupt Enable : 0000 0000 0000 0000 0013: 0040 
+Interrupt Status : 0000 0000 0100 0000 0014: 0C68 
+Extended PHY Specific Control : 0000 1100 0110 1000 0015: 0000 
+Receive Error Counter : 0000 0000 0000 0000 0016: 0000 
+Reserved Register 1 : 0000 0000 0000 0000 0017: 0000 
+Global Status : 0000 0000 0000 0000 0018: 4100 
+LED Control : 0100 0001 0000 0000 0019: 0000 
+Manual LED Override : 0000 0000 0000 0000 001A: 000A 
+Extended PHY Specific Control : 0000 0000 0000 1010 001C: 0000 
+Page select Register : 0000 0000 0000 0000 001D: 000A 
+Disable Receiver 1 : 0000 0000 0000 1010 001E: 0001 
+Disable Receiver 2 : 0000 0000 0000 0001 001B: 9084 
+Extended PHY Specific Status : 1001 0000 1000 0100 
+Auto-MDIX : On [AdminState=1 Flags=0x00052248] 
+------------------------------------------------------- 00-0A-C2, 0C-01, 01-00 
+switch#
